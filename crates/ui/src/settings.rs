@@ -343,9 +343,14 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
 
 /// Latest settings, including mutations still inside the debounce window.
 pub fn current(cx: &App) -> UiSettings {
+    try_current(cx).unwrap_or_default()
+}
+
+/// [`current`], or `None` before the store exists (some tests never make
+/// one), so callers can tell "defaults" from "nothing saved".
+pub fn try_current(cx: &App) -> Option<UiSettings> {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
-        .unwrap_or_default()
 }
 
 /// Read the picker preference without cloning the full settings for each model row.
@@ -583,6 +588,76 @@ pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSetti
 
 pub fn replace(settings: UiSettings, policy: SavePolicy, cx: &mut App) -> bool {
     update(policy, cx, |current| *current = settings)
+}
+
+/// `base` (the store's current settings) with every field `mine` changed
+/// since `from` (the copy `mine` started as) carried over. A writer holding
+/// a working copy publishes only its own edits this way, so its stale view of
+/// the fields it never touched cannot revert what other writers saved
+/// meanwhile (a General-page toggle undone by the next navigation save).
+pub fn merge_changes(from: &UiSettings, mine: &UiSettings, base: &UiSettings) -> UiSettings {
+    fn object(settings: &UiSettings) -> Option<serde_json::Map<String, serde_json::Value>> {
+        match serde_json::to_value(settings) {
+            Ok(serde_json::Value::Object(map)) => Some(map),
+            _ => None,
+        }
+    }
+    fn carry<T: PartialEq + Clone>(from: &T, mine: &T, base: &T) -> T {
+        if mine != from {
+            mine.clone()
+        } else {
+            base.clone()
+        }
+    }
+    let (Some(from_map), Some(mine_map), Some(mut out)) =
+        (object(from), object(mine), object(base))
+    else {
+        return mine.clone();
+    };
+    // Keys present on either side: a field serialized only when non-empty
+    // drops out of `mine` when cleared, and that clear is a change too.
+    let keys: std::collections::BTreeSet<&String> =
+        from_map.keys().chain(mine_map.keys()).collect();
+    for key in keys {
+        let theirs = mine_map.get(key);
+        if from_map.get(key) != theirs {
+            match theirs {
+                Some(value) => out.insert(key.clone(), value.clone()),
+                None => out.remove(key),
+            };
+        }
+    }
+    let Ok(mut merged) = serde_json::from_value::<UiSettings>(serde_json::Value::Object(out))
+    else {
+        return mine.clone();
+    };
+    // Fields serde does not round-trip on every platform travel by hand.
+    merged.appshots_enabled = carry(
+        &from.appshots_enabled,
+        &mine.appshots_enabled,
+        &base.appshots_enabled,
+    );
+    merged.appshot_sound_enabled = carry(
+        &from.appshot_sound_enabled,
+        &mine.appshot_sound_enabled,
+        &base.appshot_sound_enabled,
+    );
+    merged.appshot_destination = carry(
+        &from.appshot_destination,
+        &mine.appshot_destination,
+        &base.appshot_destination,
+    );
+    merged.keymap.capture_appshot = carry(
+        &from.keymap.capture_appshot,
+        &mine.keymap.capture_appshot,
+        &base.keymap.capture_appshot,
+    );
+    merged.legacy_accent_color = carry(
+        &from.legacy_accent_color,
+        &mine.legacy_accent_color,
+        &base.legacy_accent_color,
+    );
+    merged
 }
 
 fn schedule(policy: SavePolicy, cx: &mut App) {
@@ -1786,6 +1861,59 @@ pub use zeron_proto::SidebarSection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A settings value with every field off its default, so a field the
+    /// merge fails to carry shows up as a difference.
+    fn non_default_settings() -> UiSettings {
+        let mut s = UiSettings::default();
+        s.transcript_compact_mode = !s.transcript_compact_mode;
+        s.compact_model_picker = !s.compact_model_picker;
+        s.notifications_enabled = !s.notifications_enabled;
+        s.sidebar_width += 7.0;
+        s.appshots_enabled = !s.appshots_enabled;
+        s.keymap.capture_appshot = "cmd-alt-9".into();
+        s.space_order = vec!["a".into(), "b".into()];
+        s
+    }
+
+    #[test]
+    fn merge_changes_keeps_others_and_publishes_only_own_edits() {
+        let from = UiSettings::default();
+        // Another writer flipped compact mode in the store meanwhile.
+        let mut base = from.clone();
+        base.transcript_compact_mode = !from.transcript_compact_mode;
+        base.space_order = vec!["x".into()];
+        // This writer only moved the sidebar and cleared nothing else.
+        let mut mine = from.clone();
+        mine.sidebar_width += 12.0;
+        let merged = merge_changes(&from, &mine, &base);
+        assert_eq!(merged.transcript_compact_mode, base.transcript_compact_mode);
+        assert_eq!(merged.space_order, base.space_order);
+        assert_eq!(merged.sidebar_width, mine.sidebar_width);
+        // Clearing a list (absent from JSON when empty) is an edit too.
+        let from = non_default_settings();
+        let mut mine = from.clone();
+        mine.space_order.clear();
+        let merged = merge_changes(&from, &mine, &from);
+        assert!(merged.space_order.is_empty());
+        // Platform-skipped fields travel by hand both ways.
+        let mut base = from.clone();
+        base.keymap.capture_appshot = "cmd-alt-0".into();
+        let merged = merge_changes(&from, &from, &base);
+        assert_eq!(merged.keymap.capture_appshot, "cmd-alt-0");
+    }
+
+    #[test]
+    fn merge_changes_round_trips_every_field() {
+        // No edits on either side must reproduce the store exactly: any
+        // field serde cannot round-trip here would come back as a default.
+        let base = non_default_settings();
+        assert_eq!(merge_changes(&base, &base, &base), base);
+        assert_eq!(
+            merge_changes(&UiSettings::default(), &UiSettings::default(), &base),
+            base
+        );
+    }
 
     #[test]
     fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {

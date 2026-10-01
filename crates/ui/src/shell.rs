@@ -1958,6 +1958,10 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
+    /// The settings as of the last publish (or load). [`Self::schedule_save`]
+    /// publishes only the fields changed since, so the stale parts of
+    /// [`Self::settings`] never overwrite what other writers saved.
+    settings_published: UiSettings,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -2363,6 +2367,7 @@ impl Shell {
             import_current: None,
             boot,
             data_dir,
+            settings_published: settings.clone(),
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
@@ -4449,8 +4454,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// Publish this view's working copy to the central settings store. The
-    /// store owns the single debounce task and the only production writer.
+    /// Publish this view's edits to the central settings store. The store
+    /// owns the single debounce task and the only production writer.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance = crate::appearance::mode(cx);
         self.settings.git_history_columns = crate::history::configured_columns(cx);
@@ -4461,7 +4466,16 @@ impl Shell {
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
         self.sync_independent_settings(cx);
-        settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
+        // Publish the shell's own edits only: every other field takes the
+        // store's value, so a toggle written elsewhere (General's Compact
+        // mode, notifications, sidebar switches, ...) survives this save.
+        // Without a store nothing else can have written: the base is this
+        // shell's own last publish.
+        let base = settings::try_current(cx).unwrap_or_else(|| self.settings_published.clone());
+        let merged = settings::merge_changes(&self.settings_published, &self.settings, &base);
+        self.settings = merged.clone();
+        self.settings_published = merged.clone();
+        settings::replace(merged, SavePolicy::Debounced, cx);
     }
 
     /// Controls outside the Shell mutate these choices directly. A geometry
@@ -14582,6 +14596,74 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn shell_saves_never_revert_settings_written_outside_the_shell(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let before = cx.update(|cx| settings::current(cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // Toggles that write the store directly (the General page's
+                // Compact mode, notification and sidebar switches, ...).
+                settings::set_transcript_compact_mode(!before.transcript_compact_mode, cx);
+                settings::update(SavePolicy::Immediate, cx, |s| {
+                    s.notifications_enabled = !before.notifications_enabled;
+                    s.sidebar_show_branch = !before.sidebar_show_branch;
+                    s.escape_stops_active_agent = !before.escape_stops_active_agent;
+                });
+                // Navigating away saves the shell's own working copy.
+                shell.remember_settings_section(SettingsSection::Notifications, cx);
+                // The shell's own writes still land.
+                shell.settings.sidebar_width += 10.0;
+                shell.schedule_save(cx);
+            })
+            .unwrap();
+        let after = cx.update(|cx| settings::current(cx));
+        assert_eq!(
+            after.transcript_compact_mode,
+            !before.transcript_compact_mode
+        );
+        assert_eq!(after.notifications_enabled, !before.notifications_enabled);
+        assert_eq!(after.sidebar_show_branch, !before.sidebar_show_branch);
+        assert_eq!(
+            after.escape_stops_active_agent,
+            !before.escape_stops_active_agent
+        );
+        assert_eq!(
+            after.settings_section,
+            SettingsSection::Notifications.canonical()
+        );
+        assert_eq!(after.sidebar_width, before.sidebar_width + 10.0);
     }
 
     #[gpui::test]
