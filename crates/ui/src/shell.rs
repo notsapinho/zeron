@@ -7265,6 +7265,12 @@ impl Shell {
                             this.chat_hover_resync = true;
                             this.set_chat_archived(archive_id.clone(), !archived, cx);
                         }))
+                        // Above the pill: below it the chip would cover the next row.
+                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
+                            "Unarchive session"
+                        } else {
+                            ShortcutId::ArchiveSession.label()
+                        }))
                 })
                 .child(corner_body)
                 .into_any_element()
