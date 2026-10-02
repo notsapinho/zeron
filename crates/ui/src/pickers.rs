@@ -326,13 +326,29 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
-/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
-/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
-/// trailing slash trimmed. `home` is the device's resolved home — `None`
-/// until the first listing lands, when `~` can't expand yet. A query like
-/// `~foo` is a folder name, not a path.
+/// Whether a palette query is path-shaped (absolute, home-relative or
+/// drive-rooted) rather than a folder name to filter by.
+pub fn is_typed_path(query: &str) -> bool {
+    query.starts_with(['/', '~']) || is_windows_path(query)
+}
+
+/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`),
+/// drive-rooted (`D:\projects`) or home-relative (`~`, `~/github`). Returns the
+/// absolute path to browse, trailing separator trimmed. `home` is the device's
+/// resolved home — `None` until the first listing lands, when `~` can't expand
+/// yet. A query like `~foo` is a folder name, not a path.
 pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
     let query = query.trim();
+    if is_windows_path(query) {
+        let path = query.replace('/', "\\");
+        let trimmed = path.trim_end_matches('\\');
+        // `D:` and `D:\` both mean the drive root.
+        return Some(if trimmed.len() == 2 {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_string()
+        });
+    }
     if let Some(rest) = query.strip_prefix('~') {
         let home = home?.trim_end_matches('/');
         if rest.is_empty() {
@@ -8649,6 +8665,26 @@ mod tests {
         // `~` can't expand before the device's home is known.
         assert_eq!(typed_path_target("~/github", None), None);
         assert_eq!(typed_path_target("/disk2", None), Some("/disk2".into()));
+    }
+
+    #[test]
+    fn typed_path_target_accepts_windows_drive_paths() {
+        let home = Some(r"C:\Users\wing");
+        assert_eq!(typed_path_target(r"D:\", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:/", home), Some(r"D:\".into()));
+        assert_eq!(
+            typed_path_target(r"D:\Random\zeron\", home),
+            Some(r"D:\Random\zeron".into())
+        );
+        // Forward slashes normalise so the crumb trail can match the path.
+        assert_eq!(
+            typed_path_target("D:/Random/zeron", None),
+            Some(r"D:\Random\zeron".into())
+        );
+        assert!(is_typed_path(r"D:\x"));
+        assert!(is_typed_path("/x") && is_typed_path("~"));
+        assert!(!is_typed_path("src") && !is_typed_path("ab:/x"));
     }
 
     #[test]
