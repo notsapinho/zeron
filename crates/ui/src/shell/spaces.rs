@@ -4845,7 +4845,7 @@ impl Shell {
                         cx.stop_propagation();
                         this.open_new_session(Some(project.clone()), cx);
                     }))
-                    .tooltip(crate::settings::widgets::text_tooltip(
+                    .tooltip(crate::settings::widgets::text_tooltip_above(
                         "New chat in project",
                     ))
                     .child(
