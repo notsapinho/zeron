@@ -213,7 +213,7 @@ pub fn icon(identity: FileIconIdentity<'_>, appearance: Appearance) -> Img {
 pub(crate) fn raster(path: &SharedString, cx: &App) -> Option<Arc<RenderImage>> {
     static CACHE: LazyLock<Mutex<HashMap<SharedString, Arc<RenderImage>>>> =
         LazyLock::new(Default::default);
-    let mut cache = CACHE.lock().ok()?;
+    let mut cache = CACHE.lock().unwrap();
     if let Some(image) = cache.get(path) {
         return Some(image.clone());
     }

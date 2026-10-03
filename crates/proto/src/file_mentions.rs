@@ -122,7 +122,6 @@ pub fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 /// Replace our private URI with a provider-readable, workspace-relative link.
 /// The durable transcript retains the original chip; only outgoing text changes.
 pub fn file_mention_prompt(text: &str) -> String {
-    let text = &crate::attachment_mentions::attachment_mention_prompt(text);
     let mut out = String::new();
     let mut at = 0;
     for link in file_mention_links(text) {

@@ -908,11 +908,24 @@ struct FileMentionLink {
     range: Range<usize>,
     basename: String,
     path: String,
-    is_dir: bool,
-    prefix: char,
     kind: ChipKind,
     /// The draft number when this chip references a staged attachment.
     attachment: Option<u32>,
+}
+
+impl FileMentionLink {
+    /// The character that marks this kind of reference.
+    fn prefix(&self) -> char {
+        match self.kind {
+            ChipKind::Skill => '$',
+            ChipKind::Command => '/',
+            _ => '@',
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        self.kind == ChipKind::Directory
+    }
 }
 
 /// Build the text inserted when a workspace item is dropped at an arbitrary
@@ -960,8 +973,6 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
             range: link.range,
             basename: link.basename,
             path: link.path,
-            is_dir: link.is_dir,
-            prefix: '@',
             kind: if link.is_dir {
                 ChipKind::Directory
             } else {
@@ -1222,8 +1233,6 @@ impl TextProjection {
                         invocation.name().to_string()
                     },
                     path: invocation.detail(),
-                    is_dir: false,
-                    prefix: invocation.prefix(),
                     kind: if invocation.prefix() == '/' {
                         ChipKind::Command
                     } else {
@@ -1245,8 +1254,6 @@ impl TextProjection {
                         mention.label.clone()
                     },
                     basename: mention.label,
-                    is_dir: false,
-                    prefix: '@',
                     kind: if mention.is_image {
                         ChipKind::Image
                     } else {
@@ -1393,7 +1400,7 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
     let mut groups: HashMap<(char, &str), Vec<&FileMentionLink>> = HashMap::new();
     for link in links {
         groups
-            .entry((link.prefix, &link.basename))
+            .entry((link.prefix(), &link.basename))
             .or_default()
             .push(link);
     }
@@ -1402,9 +1409,9 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
         .iter()
         .map(|link| {
             labels
-                .entry((link.prefix, &link.basename, &link.path))
+                .entry((link.prefix(), &link.basename, &link.path))
                 .or_insert_with(|| {
-                    let duplicates: Vec<_> = groups[&(link.prefix, link.basename.as_str())]
+                    let duplicates: Vec<_> = groups[&(link.prefix(), link.basename.as_str())]
                         .iter()
                         .filter(|other| other.path != link.path)
                         .collect();
@@ -1415,7 +1422,7 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
                     let suffix = (1..=parts.len())
                         .map(|count| parts[parts.len() - count..].join("/"))
                         .find(|suffix| {
-                            if link.prefix != '@' {
+                            if link.prefix() != '@' {
                                 duplicates.iter().all(|other| !other.path.ends_with(suffix))
                             } else {
                                 let suffix: Vec<_> = suffix.split('/').collect();
@@ -1430,7 +1437,7 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
                             }
                         })
                         .unwrap_or_else(|| link.path.clone());
-                    if link.prefix == '@' {
+                    if link.prefix() == '@' {
                         suffix
                     } else {
                         format!("{} · {suffix}", link.basename)
@@ -1449,7 +1456,6 @@ pub struct SentMentionSpan {
     pub range: Range<usize>,
     /// Full workspace-relative path (labels can be shortened to basenames).
     pub path: SharedString,
-    pub is_dir: bool,
     pub kind: ChipKind,
 }
 
@@ -1482,9 +1488,8 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
             path: SharedString::from(format!(
                 "{}{}",
                 link.path,
-                if link.is_dir { "/" } else { "" }
+                if link.is_dir() { "/" } else { "" }
             )),
-            is_dir: link.is_dir,
             kind: link.kind,
         })
         .collect();
@@ -4839,7 +4844,7 @@ impl gpui::Element for ComposerTextElement {
                     SharedString::from(format!(
                         "{}{}",
                         mention.path,
-                        if mention.is_dir { "/" } else { "" }
+                        if mention.is_dir() { "/" } else { "" }
                     ))
                 },
                 attachment: mention.attachment,
@@ -14644,13 +14649,13 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].path, "src/a file#[x].rs");
         assert_eq!(links[0].basename, "a file#[x].rs");
-        assert!(!links[0].is_dir);
+        assert!(!links[0].is_dir());
 
         let folder = local_file_link("src/components", true);
         assert_eq!(folder, "[components](zeron-file:src/components/)");
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
-        assert!(links[0].is_dir);
+        assert!(links[0].is_dir());
     }
 
     #[test]
@@ -14698,8 +14703,6 @@ mod tests {
                 range: 0..0,
                 basename: "mod.rs".into(),
                 path: "foo/mod.rs".into(),
-                is_dir: false,
-                prefix: '@',
                 kind: ChipKind::File,
                 attachment: None,
             },
@@ -14707,8 +14710,6 @@ mod tests {
                 range: 0..0,
                 basename: "oomod.rs".into(),
                 path: "bar/oomod.rs".into(),
-                is_dir: false,
-                prefix: '@',
                 kind: ChipKind::File,
                 attachment: None,
             },
@@ -14762,9 +14763,7 @@ mod tests {
         );
         assert_eq!(spans[0].kind, ChipKind::File);
         assert_eq!(spans[1].kind, ChipKind::Directory);
-        assert!(!spans[0].is_dir);
         assert_eq!(spans[0].path.as_ref(), "src/composer.rs");
-        assert!(spans[1].is_dir);
         assert_eq!(spans[1].path.as_ref(), "src/components/");
     }
 
