@@ -39,7 +39,7 @@ fn percent_decode_path(encoded: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn escape_mention_label(label: &str) -> String {
+pub(crate) fn escape_mention_label(label: &str) -> String {
     label
         .replace('\\', "\\\\")
         .replace('[', "\\[")
@@ -122,6 +122,7 @@ pub fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 /// Replace our private URI with a provider-readable, workspace-relative link.
 /// The durable transcript retains the original chip; only outgoing text changes.
 pub fn file_mention_prompt(text: &str) -> String {
+    let text = &crate::attachment_mentions::attachment_mention_prompt(text);
     let mut out = String::new();
     let mut at = 0;
     for link in file_mention_links(text) {

@@ -33,10 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Entity, ListAlignment,
-    ListOffset, ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathBuilder, Pixels, Point, SharedString, StyledImage as _, StyledText, Subscription, Task,
-    TextAlign, TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
+    AnyElement, Bounds, ClipboardItem, ContentMask, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
+    Pixels, Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextAlign,
+    TextRun, Window, canvas, div, img, list, point, prelude::*, px, size,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
@@ -6116,6 +6116,10 @@ impl Transcript {
             .pt(px(4.0))
             .pb(px(6.0));
         for (aix, att) in atts.iter().enumerate() {
+            if !crate::attachments::is_image_path(&att.path) {
+                strip = strip.child(user_file_pill(&att.name, Theme::of(cx)));
+                continue;
+            }
             let state = self.attachment_state(&device_ids, &att.path, None, cx);
             // The in-flight send's progress belongs ON the thumbnail
             // (2026-08-18 user request). Two ref shapes mean "still
@@ -7959,21 +7963,14 @@ fn user_bubble_text(
         underline: None,
         strikethrough: None,
     };
-    let chip_run = |len: usize| TextRun {
-        len,
-        font: gpui::font(theme.font_mono.clone()),
-        color: theme.code_text,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
     let mut runs = Vec::with_capacity(mentions.len() * 2 + 1);
     let mut at = 0;
     for span in mentions.iter() {
         if at < span.range.start {
             runs.push(body_run(span.range.start - at));
         }
-        runs.push(chip_run(span.range.len()));
+        // Chips are labels in the body font, like the composer's.
+        runs.push(body_run(span.range.len()));
         at = span.range.end;
     }
     if at < text.len() {
@@ -8014,22 +8011,25 @@ fn user_bubble_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    let wash = theme.code_wash;
+    let chip_icons: Vec<crate::composer::ChipIcon> = mentions
+        .iter()
+        .map(|span| crate::composer::chip_icon(span.kind, &span.path, theme.appearance))
+        .collect();
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
     let underlay = canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, cx| {
-            for span in mentions.iter() {
-                for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(5.0),
-                        wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
+            for (span, icon) in mentions.iter().zip(&chip_icons) {
+                for (row, mut rect) in render::range_rects(&layout, &span.range, 0.0, 2.0)
+                    .into_iter()
+                    .enumerate()
+                {
+                    // Matches the composer: the text sits a pixel below the
+                    // line box's middle.
+                    rect.origin.y += px(1.0);
+                    let icon = (row == 0).then_some(icon);
+                    crate::composer::paint_chip(window, rect, icon, &sel_theme, cx);
                 }
             }
             render::paint_text_selection(window, hitbox, &sel_key, &text, &layout, &sel_theme);
@@ -8061,6 +8061,50 @@ fn user_bubble_text(
     render::selectable_text_wrap()
         .child(underlay)
         .child(styled)
+        .into_any_element()
+}
+
+/// A sent message's non-image attachment: the file's icon and name on the
+/// same soft pill the transcript uses for file badges. Its bytes are never
+/// read back to the transcript, so there is no thumbnail to wait for.
+fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
+    let name = crate::attachments::attachment_display_name(name);
+    div()
+        .h(px(28.0))
+        .max_w(px(260.0))
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .rounded(px(7.0))
+        .bg(theme.ink(0.06))
+        .pl(px(2.0))
+        .pr(px(10.0))
+        .text_size(px(13.0))
+        .text_color(theme.text.opacity(0.85))
+        .child(
+            div()
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .bg(crate::file_icons::well_bg(theme))
+                .child(
+                    crate::file_icons::icon(
+                        crate::file_icons::FileIconIdentity::file(name),
+                        theme.appearance,
+                    )
+                    .size(px(16.0)),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(SharedString::from(name.to_owned())),
+        )
         .into_any_element()
 }
 
@@ -14017,6 +14061,76 @@ mod tests {
     /// row carries the projected display text plus spans, while ordinary
     /// prompts keep the empty-spans fast path. The row version derives from
     /// the RAW text either way, so projection never perturbs the diff key.
+    /// A sent message with image, file-attachment and workspace-file chips
+    /// reads as chips in the bubble, with the attachments in the strip above.
+    #[test]
+    fn user_bubbles_project_attachment_chips_and_split_the_strip() {
+        use crate::composer::ChipKind;
+        use zeron_proto::attachment_mentions::attachment_mention_link;
+        let body = format!(
+            "compare {} with {} and {}",
+            attachment_mention_link(1, None),
+            attachment_mention_link(2, Some("notes.md")),
+            "[composer.rs](zeron-file:crates/ui/src/composer.rs)",
+        );
+        let raw = crate::attachments::with_attachments(
+            &body,
+            &[
+                "/uploads/ab12cd34-Image_1.png".to_string(),
+                "/uploads/ef56ab78-notes.md".to_string(),
+            ],
+        );
+        let mut entry = assistant("u4", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &raw)];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let RowKind::User {
+            text,
+            mentions,
+            attachments,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert!(!text.contains("zeron-") && !text.contains("Attached images"));
+        assert_eq!(
+            mentions.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [ChipKind::Image, ChipKind::File, ChipKind::File]
+        );
+        let labels: Vec<String> = mentions
+            .iter()
+            .map(|m| {
+                text[m.range.clone()]
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .replace('\u{a0}', " ")
+            })
+            .collect();
+        assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
+        // The strip splits images (thumbnails) from files (pills).
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|a| crate::attachments::is_image_path(&a.path))
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+
+        // A files-only send hides the placeholder body.
+        let raw = crate::attachments::with_attachments("", &["/uploads/ef56ab78-notes.md".into()]);
+        entry.parts = vec![text_part("t0", &raw)];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let RowKind::User {
+            text, attachments, ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert!(text.is_empty());
+        assert_eq!(attachments.len(), 1);
+    }
+
     #[test]
     fn user_rows_project_file_mentions_into_chips() {
         let raw = "look at [composer.rs](zeron-file:crates/ui/src/composer.rs) please";
@@ -14036,10 +14150,8 @@ mod tests {
         assert_eq!(mentions.len(), 1);
         assert!(!mentions[0].is_dir);
         assert_eq!(mentions[0].path.as_ref(), "crates/ui/src/composer.rs");
-        assert_eq!(&text[mentions[0].range.clone()], {
-            let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
-            projected
-        });
+        let chip = &text[mentions[0].range.clone()];
+        assert!(chip.starts_with('\u{00A0}') && chip.contains("composer.rs"));
         assert_eq!(rows[0].version, (raw.len() as u64) << 1);
 
         entry.parts = vec![text_part("t0", "no mentions here")];
