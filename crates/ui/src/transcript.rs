@@ -14129,7 +14129,7 @@ mod tests {
         );
         assert!(text.contains("composer.rs"));
         assert_eq!(mentions.len(), 1);
-        assert!(!mentions[0].is_dir);
+        assert_eq!(mentions[0].kind, crate::composer::ChipKind::File);
         assert_eq!(mentions[0].path.as_ref(), "crates/ui/src/composer.rs");
         let chip = &text[mentions[0].range.clone()];
         assert!(chip.starts_with('\u{00A0}') && chip.contains("composer.rs"));
