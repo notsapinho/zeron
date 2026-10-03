@@ -41,6 +41,11 @@ use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
+mod chip;
+pub use chip::ChipKind;
+use chip::*;
+pub(crate) use chip::{ChipIcon, chip_icon, chip_text, paint_chip};
+
 // ---------------------------------------------------------------------------
 // Constants + pure decision logic
 // ---------------------------------------------------------------------------
@@ -490,6 +495,25 @@ pub enum SendButtonMode {
     Stop,
 }
 
+/// Per-chat bookkeeping for attachment chips. Numbers only grow within a draft,
+/// so a removed attachment never renumbers or retargets an earlier mention.
+#[derive(Default)]
+struct AttachmentDraft {
+    /// The highest number handed out so far.
+    next: u32,
+    /// Attachments whose last chip or tile was removed. Undo that brings their
+    /// chip back restages the attachment from here.
+    unstaged: Vec<StagedAttachment>,
+}
+
+/// A staged attachment offered by the `@` list.
+struct AttachmentRow {
+    index: u32,
+    label: String,
+    /// The picture, for an image.
+    image: Option<std::sync::Arc<gpui::Image>>,
+}
+
 /// What the composer holds that a send could carry. A staged image or diff
 /// comment counts: both synthesize their own prompt body, so either alone is
 /// a legal send — and during a live run has to read as Queue, not Stop.
@@ -886,6 +910,9 @@ struct FileMentionLink {
     path: String,
     is_dir: bool,
     prefix: char,
+    kind: ChipKind,
+    /// The draft number when this chip references a staged attachment.
+    attachment: Option<u32>,
 }
 
 /// Build the text inserted when a workspace item is dropped at an arbitrary
@@ -902,16 +929,10 @@ fn reference_suffix(next: Option<char>) -> (&'static str, usize) {
     }
 }
 
-fn dropped_file_mention(
-    content: &str,
-    range: Range<usize>,
-    path: &str,
-    is_dir: bool,
-) -> Option<(String, usize)> {
-    if range.start > range.end
-        || !local_path_is_safe(path)
-        || !content.is_char_boundary(range.start)
-    {
+/// Place a reference link at an arbitrary selection, supplying the separators
+/// a completion would already have had around it.
+fn dropped_reference(content: &str, range: Range<usize>, link: &str) -> Option<(String, usize)> {
+    if range.start > range.end || !content.is_char_boundary(range.start) {
         return None;
     }
     let suffix = content.get(range.end..)?;
@@ -927,7 +948,7 @@ fn dropped_file_mention(
         ""
     };
     let (trailing, advance) = reference_suffix(suffix.chars().next());
-    let inserted = format!("{prefix}{}{trailing}", local_file_link(path, is_dir));
+    let inserted = format!("{prefix}{link}{trailing}");
     let cursor_advance = inserted.len() + advance;
     Some((inserted, cursor_advance))
 }
@@ -941,6 +962,12 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
             path: link.path,
             is_dir: link.is_dir,
             prefix: '@',
+            kind: if link.is_dir {
+                ChipKind::Directory
+            } else {
+                ChipKind::File
+            },
+            attachment: None,
         })
         .collect()
 }
@@ -958,6 +985,8 @@ struct TextProjection {
 struct MentionTooltipTarget {
     range: Range<usize>,
     path: SharedString,
+    /// Set for attachment chips; an image's tooltip previews it.
+    attachment: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,14 +1195,21 @@ fn wrap_reference_chips(line: &mut WrappedLine, chips: &[Range<usize>], width: P
 
 impl TextProjection {
     fn new(raw: &str) -> Self {
-        Self::project(raw, None, false)
+        Self::project(raw, None, false, None)
     }
 
-    fn rich(raw: &str, active: Option<Range<usize>>) -> Self {
-        Self::project(raw, active, true)
+    /// `live` names the attachments the draft still holds; a chip outside it is
+    /// a dangling reference and shows as its plain label.
+    fn rich(raw: &str, active: Option<Range<usize>>, live: Option<&HashSet<u32>>) -> Self {
+        Self::project(raw, active, true, live)
     }
 
-    fn project(raw: &str, active: Option<Range<usize>>, compact: bool) -> Self {
+    fn project(
+        raw: &str,
+        active: Option<Range<usize>>,
+        compact: bool,
+        live: Option<&HashSet<u32>>,
+    ) -> Self {
         let mut links = file_mention_links(raw);
         links.extend(
             zeron_proto::invocation::invocation_links(raw)
@@ -1188,6 +1224,35 @@ impl TextProjection {
                     path: invocation.detail(),
                     is_dir: false,
                     prefix: invocation.prefix(),
+                    kind: if invocation.prefix() == '/' {
+                        ChipKind::Command
+                    } else {
+                        ChipKind::Skill
+                    },
+                    attachment: None,
+                }),
+        );
+        links.extend(
+            zeron_proto::attachment_mentions::attachment_mentions(raw)
+                .into_iter()
+                .map(|mention| FileMentionLink {
+                    range: mention.range,
+                    // A file attachment's chip names the file, so its icon
+                    // follows the name; an image has no path to follow.
+                    path: if mention.is_image {
+                        String::new()
+                    } else {
+                        mention.label.clone()
+                    },
+                    basename: mention.label,
+                    is_dir: false,
+                    prefix: '@',
+                    kind: if mention.is_image {
+                        ChipKind::Image
+                    } else {
+                        ChipKind::File
+                    },
+                    attachment: Some(mention.index),
                 }),
         );
         links.sort_by_key(|link| link.range.start);
@@ -1203,13 +1268,14 @@ impl TextProjection {
             .zip(labels)
             .map(|(link, label)| {
                 let label = label.replace(' ', "\u{00A0}");
-                let marker = link.prefix;
+                if let (Some(index), Some(live)) = (link.attachment, live)
+                    && !live.contains(&index)
+                {
+                    return (link.range.clone(), link.basename.clone(), None);
+                }
                 let pad = MENTION_SIDE_PAD;
-                (
-                    link.range.clone(),
-                    format!("{pad}{marker}{label}{pad}"),
-                    Some(link),
-                )
+                let display = format!("{pad}{CHIP_ICON_SLOT}{label}{CHIP_TRAILING_PAD}");
+                (link.range.clone(), display, Some(link))
             })
             .collect();
         if let Some(active) = active {
@@ -1384,6 +1450,15 @@ pub struct SentMentionSpan {
     /// Full workspace-relative path (labels can be shortened to basenames).
     pub path: SharedString,
     pub is_dir: bool,
+    pub kind: ChipKind,
+}
+
+/// Cheap probe: whether `raw` could hold a file, skill or attachment chip.
+fn has_mention_scheme(raw: &str) -> bool {
+    raw.contains(FILE_MENTION_SCHEME)
+        || raw.contains(zeron_proto::invocation::INVOCATION_SCHEME)
+        || raw.contains(zeron_proto::attachment_mentions::IMAGE_MENTION_SCHEME)
+        || raw.contains(zeron_proto::attachment_mentions::ATTACHMENT_MENTION_SCHEME)
 }
 
 /// Project a sent message's raw Markdown for transcript display: mention links
@@ -1392,9 +1467,7 @@ pub struct SentMentionSpan {
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
-    if !raw.contains(FILE_MENTION_SCHEME)
-        && !raw.contains(zeron_proto::invocation::INVOCATION_SCHEME)
-    {
+    if !has_mention_scheme(raw) {
         return None;
     }
     let projection = TextProjection::new(raw);
@@ -1412,6 +1485,7 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
                 if link.is_dir { "/" } else { "" }
             )),
             is_dir: link.is_dir,
+            kind: link.kind,
         })
         .collect();
     Some((projection.display, spans))
@@ -1921,6 +1995,13 @@ pub struct ComposerInput {
     /// Last prepainted chip bounds; the paint-phase pointer listener uses
     /// these instead of attempting to infer text geometry from the cursor.
     mention_hits: Vec<MentionHit>,
+    /// The attachments the draft holds, by chip number, with the preview of
+    /// each image. `None` outside the composer, where every attachment link is
+    /// shown as a chip.
+    attachment_chips: Option<HashMap<u32, ChipAttachment>>,
+    /// The draft the attachment chips belong to; copied chips carry it so a paste
+    /// into another draft can tell it must not reuse their numbers.
+    attachment_scope: String,
     mention_tooltip: MentionTooltipPhase,
     mention_tooltip_generation: u64,
     mention_tooltip_popup: Option<Bounds<Pixels>>,
@@ -2006,6 +2087,8 @@ impl ComposerInput {
             mention_open: false,
             mention_has_selection: false,
             mention_hits: Vec::new(),
+            attachment_chips: None,
+            attachment_scope: String::new(),
             mention_tooltip: MentionTooltipPhase::Hidden,
             mention_tooltip_generation: 0,
             mention_tooltip_popup: None,
@@ -2108,7 +2191,15 @@ impl ComposerInput {
 
     fn refresh_projection(&mut self) {
         self.projection = if self.mentions_enabled {
-            TextProjection::rich(&self.content, Some(self.editing_source_range()))
+            let live: Option<HashSet<u32>> = self
+                .attachment_chips
+                .as_ref()
+                .map(|images| images.keys().copied().collect());
+            TextProjection::rich(
+                &self.content,
+                Some(self.editing_source_range()),
+                live.as_ref(),
+            )
         } else {
             TextProjection {
                 display: self.content.clone(),
@@ -2126,13 +2217,25 @@ impl ComposerInput {
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only || self.marked_range.is_some() || !local_path_is_safe(path) {
+        if !local_path_is_safe(path) {
+            return;
+        }
+        self.replace_mention_link(range, &local_file_link(path, is_dir), cx);
+    }
+
+    /// Replace a completed `@query` token with a canonical reference link.
+    pub(crate) fn replace_mention_link(
+        &mut self,
+        range: Range<usize>,
+        link: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only || self.marked_range.is_some() {
             return;
         }
         self.invalidate_mention_tooltip();
-        let path = local_file_link(path, is_dir);
         let (trailing, advance) = reference_suffix(self.content[range.end..].chars().next());
-        let inserted = format!("{path}{trailing}");
+        let inserted = format!("{link}{trailing}");
         self.record_edit(&range, &inserted);
         self.edit_revision = self.edit_revision.wrapping_add(1);
         self.content =
@@ -2154,6 +2257,94 @@ impl ComposerInput {
     /// uses the same strict local Markdown transport and projected chip as an
     /// `@` mention selected from completion.
     fn insert_dropped_mention(&mut self, path: &str, is_dir: bool, cx: &mut Context<Self>) -> bool {
+        if !local_path_is_safe(path) {
+            return false;
+        }
+        self.insert_reference(&local_file_link(path, is_dir), cx)
+    }
+
+    /// Delete every chip that mentions attachment `index`, along with one separator
+    /// when the chip sat between spaces. Returns whether anything was removed.
+    pub(crate) fn remove_attachment_chips(&mut self, index: u32, cx: &mut Context<Self>) -> bool {
+        if self.read_only || self.marked_range.is_some() {
+            return false;
+        }
+        let ranges: Vec<Range<usize>> =
+            zeron_proto::attachment_mentions::attachment_mentions(&self.content)
+                .into_iter()
+                .filter(|mention| mention.index == index)
+                .map(|mention| mention.range)
+                .collect();
+        if ranges.is_empty() {
+            return false;
+        }
+        self.invalidate_mention_tooltip();
+        for mut range in ranges.into_iter().rev() {
+            let separated =
+                range.start == 0 || self.content[..range.start].ends_with(char::is_whitespace);
+            if separated && self.content[range.end..].starts_with(' ') {
+                range.end += 1;
+            }
+            self.record_edit(&range, "");
+            self.edit_revision = self.edit_revision.wrapping_add(1);
+            self.content.replace_range(range.clone(), "");
+            let shift = |offset: usize| {
+                if offset >= range.end {
+                    offset - range.len()
+                } else {
+                    offset.min(range.start)
+                }
+            };
+            self.selected_range = shift(self.selected_range.start)..shift(self.selected_range.end);
+        }
+        self.last_edit = None;
+        self.selection_reversed = false;
+        self.preferred_column = None;
+        self.refresh_projection();
+        self.reset_blink();
+        self.needs_measure = true;
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+        true
+    }
+
+    /// Tell the editor which staged attachments its chips may reference (`None`
+    /// for one that is not an image). Chips for any other number show as plain
+    /// text.
+    pub(crate) fn set_attachment_chips(
+        &mut self,
+        scope: &str,
+        attachments: HashMap<u32, Option<std::sync::Arc<gpui::Image>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self.attachment_scope == scope
+            && self.attachment_chips.as_ref().is_some_and(|current| {
+                current.len() == attachments.len()
+                    && attachments.iter().all(|(index, image)| {
+                        current.get(index).is_some_and(|known| {
+                            known.image.as_ref().map(std::sync::Arc::as_ptr)
+                                == image.as_ref().map(std::sync::Arc::as_ptr)
+                        })
+                    })
+            });
+        if unchanged {
+            return;
+        }
+        self.attachment_scope = scope.to_string();
+        self.attachment_chips = Some(
+            attachments
+                .into_iter()
+                .map(|(index, image)| (index, ChipAttachment::new(image)))
+                .collect(),
+        );
+        self.invalidate_mention_tooltip();
+        self.refresh_projection();
+        self.needs_measure = true;
+        cx.notify();
+    }
+
+    /// Insert a canonical reference link at the selection, as one undo step.
+    pub(crate) fn insert_reference(&mut self, link: &str, cx: &mut Context<Self>) -> bool {
         // The platform still owns the marked range during IME composition.
         // Inserting a chip into it would leave those offsets pointing inside
         // the new reference, and the next IME update could delete the chip.
@@ -2162,7 +2353,7 @@ impl ComposerInput {
         }
         let range = self.selected_range.clone();
         let Some((inserted, cursor_advance)) =
-            dropped_file_mention(&self.content, range.clone(), path, is_dir)
+            dropped_reference(&self.content, range.clone(), link)
         else {
             return false;
         };
@@ -2348,9 +2539,14 @@ impl ComposerInput {
                     if let MentionTooltipPhase::Visible { target, generation } =
                         &input.mention_tooltip
                     {
+                        let image = target.attachment.and_then(|index| {
+                            let chip = input.attachment_chips.as_ref()?.get(&index)?;
+                            Some((chip.image.clone()?, chip.preview))
+                        });
                         input.mention_tooltip_view = Some(cx.new(|_| MentionPathTooltip {
                             path: target.path.clone(),
                             activation: *generation,
+                            image,
                         }));
                     }
                     cx.notify();
@@ -3159,7 +3355,11 @@ impl ComposerInput {
         if let Some((raw, text)) = self.clipboard_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                 text.clone(),
-                serde_json::json!({ "zeronComposerV1": raw, "text": text }),
+                serde_json::json!({
+                    "zeronComposerV1": raw,
+                    "text": text,
+                    "zeronAttachmentScope": self.attachment_scope,
+                }),
             ));
         } else if self.copies_transcript_selection
             && let Some(text) = crate::markdown::selection::selected_text()
@@ -3175,7 +3375,11 @@ impl ComposerInput {
         if let Some((raw, text)) = self.clipboard_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                 text.clone(),
-                serde_json::json!({ "zeronComposerV1": raw, "text": text }),
+                serde_json::json!({
+                    "zeronComposerV1": raw,
+                    "text": text,
+                    "zeronAttachmentScope": self.attachment_scope,
+                }),
             ));
 
             self.last_edit = None;
@@ -3221,7 +3425,19 @@ impl ComposerInput {
                 {
                     if value.get("text").and_then(|v| v.as_str()) == Some(text.as_str()) {
                         if let Some(raw) = value.get("zeronComposerV1").and_then(|v| v.as_str()) {
-                            text = raw.to_owned();
+                            // Chip numbers belong to one draft: chips copied from
+                            // another chat would name the wrong attachment, so
+                            // they paste as their plain labels instead.
+                            let from_this_draft = value
+                                .get("zeronAttachmentScope")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|scope| scope == self.attachment_scope);
+                            if from_this_draft
+                                || zeron_proto::attachment_mentions::attachment_mentions(raw)
+                                    .is_empty()
+                            {
+                                text = raw.to_owned();
+                            }
                         }
                     }
                 }
@@ -3910,20 +4126,20 @@ impl ComposerInput {
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(self.configured_line_height);
 
-        // Chips read as inline code: the markdown renderer's recipe (mono font
-        // + the spectrum's `code_text`) over the rounded `code_wash` beneath.
+        // Inline code: the markdown renderer's recipe (mono font + the
+        // spectrum's `code_text`) over the rounded `code_wash` beneath.
         let (chip_font, chip_color) = {
             let theme = Theme::of(cx);
             (gpui::font(theme.font_mono.clone()), theme.code_text)
         };
-        let run_for = |len: usize, underline: bool, chip: bool| TextRun {
+        let run_for = |len: usize, underline: bool, code: bool| TextRun {
             len,
-            font: if chip {
+            font: if code {
                 chip_font.clone()
             } else {
                 style.font()
             },
-            color: if chip { chip_color } else { style.color },
+            color: if code { chip_color } else { style.color },
             // Rounded mention washes are painted explicitly beneath the text;
             // TextRun backgrounds are square and can disappear in wrapped runs.
             background_color: None,
@@ -4020,7 +4236,7 @@ impl ComposerInput {
                 let mut run = run_for(
                     r[1] - r[0],
                     marked.as_ref().is_some_and(|range| range.contains(&r[0])),
-                    chip || code,
+                    code,
                 );
                 if !chip {
                     if face_depth[composer_markdown::Face::Bold as usize] > 0 {
@@ -4449,6 +4665,8 @@ struct ComposerTextElement {
 
 struct MentionPathTooltip {
     path: SharedString,
+    /// An image chip's picture and the size it is shown at.
+    image: Option<(std::sync::Arc<gpui::Image>, (f32, f32))>,
     /// Stable for one `Waiting → Visible` promotion; a later activation gets
     /// a new key and therefore exactly one fresh fade-in.
     activation: u64,
@@ -4457,22 +4675,64 @@ struct MentionPathTooltip {
 impl Render for MentionPathTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();
+        let card = match &self.image {
+            // The chip already names the image, so its card is the picture
+            // alone, with rounded corners inside an even inset.
+            Some((image, (width, height))) => crate::popover::popover_card(&theme)
+                .rounded(px(IMAGE_TOOLTIP_RADIUS))
+                .p(px(IMAGE_TOOLTIP_INSET))
+                .gap(px(0.0))
+                .child(
+                    div()
+                        .w(px(*width))
+                        .h(px(*height))
+                        .rounded(px(IMAGE_TOOLTIP_RADIUS - IMAGE_TOOLTIP_INSET))
+                        .overflow_hidden()
+                        .bg(crate::theme::ink(0.06))
+                        .child(
+                            img(image.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(IMAGE_TOOLTIP_LABEL_HEIGHT))
+                        .px(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .text_size(px(11.0))
+                        .child(div().text_color(theme.text).child(self.path.clone()))
+                        .child(
+                            div()
+                                .text_color(theme.text_muted)
+                                .child(format_file_size(image.bytes.len())),
+                        ),
+                ),
+            None => crate::popover::popover_card(&theme)
+                .max_w(px(480.0))
+                .h(px(MENTION_TOOLTIP_HEIGHT))
+                .flex()
+                .items_center()
+                .p_0()
+                .px(px(8.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(div().min_w_0().truncate().child(self.path.clone())),
+        };
         motion::fade_quick(
             ("file-mention-path-tooltip", self.activation),
             div().child(crate::frost::frosted(
-                crate::popover::CARD_RADIUS,
+                if self.image.is_some() {
+                    IMAGE_TOOLTIP_RADIUS
+                } else {
+                    crate::popover::CARD_RADIUS
+                },
                 crate::frost::MENU_BLUR,
-                crate::popover::popover_card(&theme)
-                    .h(px(MENTION_TOOLTIP_HEIGHT))
-                    .max_w(px(480.0))
-                    .flex()
-                    .items_center()
-                    .p_0()
-                    .px(px(8.0))
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(div().min_w_0().truncate().child(self.path.clone())),
+                card,
             )),
         )
     }
@@ -4480,7 +4740,8 @@ impl Render for MentionPathTooltip {
 
 struct ComposerTextPrepaint {
     cursor: Option<PaintQuad>,
-    mention_quads: Vec<PaintQuad>,
+    /// Each chip row's bounds; the first row of a chip also carries its icon.
+    mention_chips: Vec<(Bounds<Pixels>, Option<ChipIcon>)>,
     mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
     /// Completion preview: window-space origin of the end-of-text caret plus
@@ -4564,37 +4825,56 @@ impl gpui::Element for ComposerTextElement {
         let origin = point(bounds.left() - px(input.scroll_left), bounds.top() - scroll);
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
-        // The inline-code recipe: chips use the spectrum wash like `code` spans.
-        let mention_color = Theme::of(cx).code_wash;
 
-        let mut mention_quads = Vec::new();
+        let mut mention_chips = Vec::new();
+        let appearance = Theme::of(cx).appearance;
         let mut mention_hits = Vec::new();
         for (mention, display) in &input.projection.mentions {
+            let mut first_row = true;
             let target = MentionTooltipTarget {
                 range: mention.range.clone(),
-                path: SharedString::from(format!(
-                    "{}{}",
-                    mention.path,
-                    if mention.is_dir { "/" } else { "" }
-                )),
+                path: if mention.attachment.is_some() {
+                    SharedString::from(mention.basename.clone())
+                } else {
+                    SharedString::from(format!(
+                        "{}{}",
+                        mention.path,
+                        if mention.is_dir { "/" } else { "" }
+                    ))
+                },
+                attachment: mention.attachment,
             };
+            // A picture floats a little clear of its chip; the path tooltip
+            // stays flush so the pointer can move onto it.
+            let (tooltip_height, tooltip_gap) = mention
+                .attachment
+                .and_then(|index| input.attachment_chips.as_ref()?.get(&index))
+                .filter(|chip| chip.image.is_some())
+                .map_or((MENTION_TOOLTIP_HEIGHT, 1.0), |chip| {
+                    (
+                        chip.preview.1
+                            + IMAGE_TOOLTIP_LABEL_HEIGHT
+                            + 2.0 * IMAGE_TOOLTIP_INSET
+                            + 2.0,
+                        5.0,
+                    )
+                });
             for local_bounds in input.bounds_for_display_range(display.clone()) {
                 let chip_bounds = Bounds::new(
                     point(
                         origin.x + local_bounds.origin.x,
-                        origin.y + local_bounds.origin.y + px(2.0),
+                        // A pixel lower than the row's middle: the text's
+                        // visual center sits below the line box's.
+                        origin.y + local_bounds.origin.y + px(2.5),
                     ),
-                    size(local_bounds.size.width, local_bounds.size.height - px(4.0)),
+                    size(local_bounds.size.width, local_bounds.size.height - px(3.0)),
                 );
-                mention_quads.push(quad(
+                mention_chips.push((
                     chip_bounds,
-                    px(5.0),
-                    mention_color,
-                    px(0.0),
-                    gpui::transparent_black(),
-                    BorderStyle::default(),
+                    first_row.then(|| chip_icon(mention.kind, &mention.path, appearance)),
                 ));
-                let above_anchor = chip_bounds.top() - px(MENTION_TOOLTIP_HEIGHT) - px(1.0);
+                first_row = false;
+                let above_anchor = chip_bounds.top() - px(tooltip_height) - px(tooltip_gap);
                 let anchor_y = if above_anchor >= px(0.0) {
                     above_anchor
                 } else {
@@ -4709,7 +4989,7 @@ impl gpui::Element for ComposerTextElement {
             });
         ComposerTextPrepaint {
             cursor,
-            mention_quads,
+            mention_chips,
             mention_hits,
             selection_quads,
             ghost,
@@ -4761,8 +5041,9 @@ impl gpui::Element for ComposerTextElement {
                 bounds: paint_bounds,
             }),
             |window| {
-                for quad in prepaint.mention_quads.drain(..) {
-                    window.paint_quad(quad);
+                let theme = Theme::of(cx).clone();
+                for (chip, icon) in prepaint.mention_chips.drain(..) {
+                    paint_chip(window, chip, icon.as_ref(), &theme, cx);
                 }
                 for quad in prepaint.selection_quads.drain(..) {
                     window.paint_quad(quad);
@@ -5632,6 +5913,7 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     pub(crate) attachments: HashMap<String, Vec<StagedAttachment>>,
+    attachment_drafts: HashMap<String, AttachmentDraft>,
     /// Rich window captures keyed exactly like drafts and ordinary staged
     /// attachments. Each owns one screenshot that joins the existing upload
     /// path only at send time.
@@ -5953,6 +6235,7 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            attachment_drafts: HashMap::new(),
             appshots: HashMap::new(),
             appshot_entrances: HashMap::new(),
             preview: None,
@@ -6055,18 +6338,14 @@ impl Composer {
             if std::env::var("ZERON_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
             {
-                composer.preview = Some(attachments::PreviewImage::new(
-                    first.name.clone(),
-                    first.image.clone(),
-                ));
+                composer.preview = first
+                    .image()
+                    .map(|image| attachments::PreviewImage::new(first.name.clone(), image.clone()));
                 composer.preview_focus_pending = true;
             }
             if !staged.is_empty() {
-                composer
-                    .attachments
-                    .entry(composer.current_key.clone())
-                    .or_default()
-                    .extend(staged);
+                let key = composer.current_key.clone();
+                composer.adopt_staged_attachments(key, staged, cx);
             }
         }
         composer
@@ -6242,7 +6521,7 @@ impl Composer {
                     }
                 }
                 if !staged.is_empty() && !this.queue_edit_finishing {
-                    this.attachments.entry(key).or_default().extend(staged);
+                    this.adopt_staged_attachments(key, staged, cx);
                     this.focus_pending = true;
                 }
                 cx.notify();
@@ -6252,15 +6531,14 @@ impl Composer {
         .detach();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Stage files (picker / drop / pasted paths): images with thumbnails, any
+    /// other file as opaque bytes. Folders, read failures and oversize files
+    /// surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.stage_in_background(
             move || {
                 paths
                     .iter()
-                    .filter(|path| attachments::format_by_extension(path).is_some())
                     .map(|path| attachments::stage_file(path))
                     .collect()
             },
@@ -6290,16 +6568,154 @@ impl Composer {
         }
     }
 
+    /// The next chip number for a draft: above everything it holds or
+    /// mentions, so a number is never reused.
+    fn next_attachment_index(&mut self, key: &str, text: &str) -> u32 {
+        let held = self
+            .attachments
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(|att| att.mention)
+            .max();
+        let mentioned = zeron_proto::attachment_mentions::attachment_mention_indices(text)
+            .into_iter()
+            .max();
+        let draft = self.attachment_drafts.entry(key.to_string()).or_default();
+        draft.next = draft
+            .next
+            .max(held.unwrap_or(0))
+            .max(mentioned.unwrap_or(0))
+            + 1;
+        draft.next
+    }
+
+    /// Add newly staged files to a draft. Each is numbered and mentioned at the
+    /// caret as one edit: images read "Image 1", "Image 2", ...; other files
+    /// keep their name. A file the editor cannot take a chip for, or that was
+    /// staged for a draft the user has since left, stays a plain attachment.
+    fn adopt_staged_attachments(
+        &mut self,
+        key: String,
+        mut staged: Vec<StagedAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if key != self.current_key {
+            self.attachments.entry(key).or_default().extend(staged);
+            return;
+        }
+        let text = self.input.read(cx).text().to_string();
+        let mut links = Vec::with_capacity(staged.len());
+        let mut indices = Vec::with_capacity(staged.len());
+        for att in &mut staged {
+            let index = self.next_attachment_index(&key, &text);
+            let file_name = match att.image() {
+                Some(image) => {
+                    att.name = attachments::ensure_extension(
+                        &zeron_proto::attachment_mentions::image_label(index),
+                        image.format,
+                    );
+                    None
+                }
+                None => Some(att.name.as_str()),
+            };
+            links.push(zeron_proto::attachment_mentions::attachment_mention_link(
+                index, file_name,
+            ));
+            indices.push(index);
+        }
+        // Chips are inserted before the attachments join the draft, so a
+        // draft that cannot take them (read-only, composing) keeps the files
+        // and their original names.
+        let mentioned = self
+            .input
+            .update(cx, |input, cx| input.insert_reference(&links.join(" "), cx));
+        if mentioned {
+            for (att, index) in staged.iter_mut().zip(indices) {
+                att.mention = Some(index);
+            }
+        }
+        self.attachments.entry(key).or_default().extend(staged);
+        self.sync_attachment_chips(cx);
+        cx.notify();
+    }
+
+    /// Hand the editor the attachments its chips may reference.
+    fn sync_attachment_chips(&mut self, cx: &mut Context<Self>) {
+        let attachments: HashMap<u32, Option<std::sync::Arc<gpui::Image>>> = self
+            .staged()
+            .iter()
+            .filter_map(|att| att.mention.map(|index| (index, att.image().cloned())))
+            .collect();
+        let scope = self.current_key.clone();
+        self.input.update(cx, |input, cx| {
+            input.set_attachment_chips(&scope, attachments, cx)
+        });
+    }
+
+    /// Keep staged attachments and their chips in step: one whose last chip is
+    /// gone leaves the draft (kept for undo), and one whose chip came back
+    /// returns. Attachments the prompt never mentions are left alone.
+    fn reconcile_attachment_mentions(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_none() && !self.queue_edit_finishing && self.editing_queued.is_none() {
+            let mentioned = zeron_proto::attachment_mentions::attachment_mention_indices(
+                self.input.read(cx).text(),
+            );
+            let is_mentioned =
+                |att: &StagedAttachment| att.mention.is_none_or(|index| mentioned.contains(&index));
+            let key = self.current_key.clone();
+            let draft = self.attachment_drafts.entry(key.clone()).or_default();
+            let (restored, mut stash): (Vec<_>, Vec<_>) = std::mem::take(&mut draft.unstaged)
+                .into_iter()
+                .partition(is_mentioned);
+            let (mut kept, dropped): (Vec<_>, Vec<_>) = self
+                .attachments
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .partition(is_mentioned);
+            let changed = !restored.is_empty() || !dropped.is_empty();
+            kept.extend(restored);
+            kept.sort_by_key(|att| att.mention.unwrap_or(0));
+            stash.extend(dropped);
+            draft.unstaged = stash;
+            if !kept.is_empty() {
+                self.attachments.insert(key, kept);
+            }
+            if changed {
+                cx.notify();
+            }
+        }
+        self.sync_attachment_chips(cx);
+    }
+
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.queue_edit_finishing {
             return;
         }
+        let mut mention = None;
         if let Some(list) = self.attachments.get_mut(&self.current_key) {
-            list.retain(|a| a.id != id);
+            if let Some(at) = list.iter().position(|a| a.id == id) {
+                let removed = list.remove(at);
+                if let Some(index) = removed.mention {
+                    mention = Some(index);
+                    // Undo of the chip removal below restages this image.
+                    self.attachment_drafts
+                        .entry(self.current_key.clone())
+                        .or_default()
+                        .unstaged
+                        .push(removed);
+                }
+            }
             if list.is_empty() {
                 self.attachments.remove(&self.current_key);
             }
         }
+        if let Some(index) = mention {
+            self.input
+                .update(cx, |input, cx| input.remove_attachment_chips(index, cx));
+        }
+        self.sync_attachment_chips(cx);
         cx.notify();
     }
 
@@ -6340,6 +6756,7 @@ impl Composer {
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
+        self.attachment_drafts.remove(chat_id);
         self.appshots.remove(chat_id);
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
@@ -6398,7 +6815,6 @@ impl Composer {
             .pt(px(STRIP_PAD_TOP));
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage::new(att.name.clone(), att.image.clone());
             let remove_id = att.id.clone();
             let remove_label: SharedString = format!("Remove {}", att.name).into();
             strip = strip.child(
@@ -6406,39 +6822,7 @@ impl Composer {
                     .group(group.clone())
                     .flex_none()
                     .relative()
-                    .child(
-                        div()
-                            .id(("composer-att-thumb", ix))
-                            .size(px(STRIP_THUMB))
-                            .rounded(px(8.0))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(crate::theme::hairline(0.10))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                preview.viewer.reset();
-                                this.preview = Some(preview.clone());
-                                this.preview_focus_pending = true;
-                                cx.notify();
-                            }))
-                            .child(
-                                img(att.image.clone())
-                                    // EXPLICIT dims, not size_full: img layout
-                                    // honors the image's intrinsic aspect
-                                    // ratio over a percent height (gpui
-                                    // f8d8a90 repoint), so size_full let a
-                                    // tall photo grow past the frame — the
-                                    // rectangular overflow clip then squared
-                                    // the bottom corners (2026-08-19 report).
-                                    // 56−2 = frame minus its 1px borders.
-                                    .w(px(STRIP_THUMB - 2.0))
-                                    .h(px(STRIP_THUMB - 2.0))
-                                    // Own radii — the frame's rounding only
-                                    // clips rectangularly (7 = 8 - border).
-                                    .rounded(px(7.0))
-                                    .object_fit(ObjectFit::Cover),
-                            ),
-                    )
+                    .child(self.attachment_tile(att, ix, cx))
                     // Own layer: inside the frosted pill everything shares one
                     // draw order and images render last, so without it the
                     // thumbnail paints OVER this button (user report).
@@ -6480,6 +6864,75 @@ impl Composer {
         Some(strip)
     }
 
+    /// One staged attachment's tile: an image's thumbnail (a click opens the
+    /// full-size preview) or a file's icon and name.
+    fn attachment_tile(
+        &self,
+        att: &StagedAttachment,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let frame = div()
+            .id(("composer-att-thumb", ix))
+            .size(px(STRIP_THUMB))
+            .rounded(px(8.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(crate::theme::hairline(0.10));
+        let Some(image) = att.image() else {
+            let theme = Theme::of(cx);
+            return frame
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(3.0))
+                .px(px(4.0))
+                .child(
+                    crate::file_icons::icon(
+                        crate::file_icons::FileIconIdentity::file(&att.name),
+                        theme.appearance,
+                    )
+                    .size(px(24.0)),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_center()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(att.name.clone())),
+                )
+                .into_any_element();
+        };
+        let preview = attachments::PreviewImage::new(att.name.clone(), image.clone());
+        frame
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                preview.viewer.reset();
+                this.preview = Some(preview.clone());
+                this.preview_focus_pending = true;
+                cx.notify();
+            }))
+            .child(
+                img(image.clone())
+                    // EXPLICIT dims, not size_full: img layout honors the
+                    // image's intrinsic aspect ratio over a percent height
+                    // (gpui f8d8a90 repoint), so size_full let a tall photo
+                    // grow past the frame — the rectangular overflow clip
+                    // then squared the bottom corners (2026-08-19 report).
+                    // 56−2 = frame minus its 1px borders.
+                    .w(px(STRIP_THUMB - 2.0))
+                    .h(px(STRIP_THUMB - 2.0))
+                    // Own radii — the frame's rounding only clips
+                    // rectangularly (7 = 8 - border).
+                    .rounded(px(7.0))
+                    .object_fit(ObjectFit::Cover),
+            )
+            .into_any_element()
+    }
+
     fn render_appshot_strip(
         &self,
         theme: &Theme,
@@ -6504,10 +6957,13 @@ impl Composer {
             - 2.0 * STRIP_PAD_X
             - 2.0 * APPSHOT_IMAGE_INSET;
         for (ix, appshot) in appshots.iter().enumerate() {
+            let Some(screenshot) = appshot.screenshot.image().cloned() else {
+                continue;
+            };
             let group: SharedString = format!("composer-appshot-{}", appshot.id).into();
             let preview = crate::attachments::PreviewImage::new(
                 appshot.screenshot.name.clone(),
-                appshot.screenshot.image.clone(),
+                screenshot.clone(),
             );
             let preview_on_key = preview.clone();
             let preview_on_a11y = preview.clone();
@@ -6606,7 +7062,7 @@ impl Composer {
                                     44.0,
                                     false,
                                     true,
-                                    img(appshot.screenshot.image.clone())
+                                    img(screenshot)
                                         .w(px(image_width))
                                         .h(px(image_height))
                                         .object_fit(ObjectFit::Contain),
@@ -6970,6 +7426,7 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_attachment_mentions(cx);
         if self.wizard.is_some() {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
@@ -7030,7 +7487,7 @@ impl Composer {
         self.mention.token = token.clone();
         if !refining {
             self.mention.results.clear();
-            self.mention.active = None;
+            self.mention.active = (!self.mention_attachment_matches().is_empty()).then_some(0);
             // Fresh open: the row stack restarts at the top.
             crate::popover::reset_menu_scroll(&self.mention_scroll, &mut self.popup_bar);
         }
@@ -7084,7 +7541,9 @@ impl Composer {
                             // that the canonical reference format cannot encode.
                             results.retain(|result| local_path_is_safe(&result.path));
                             composer.mention.error = None;
-                            composer.mention.active = (!results.is_empty()).then_some(0);
+                            composer.mention.active = (!results.is_empty()
+                                || !composer.mention_attachment_matches().is_empty())
+                            .then_some(0);
                             composer.mention.results = results;
                             // New result set: the row stack restarts at the top.
                             crate::popover::reset_menu_scroll(
@@ -7097,7 +7556,8 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(%err, "file mention search failed");
                         composer.mention.results.clear();
-                        composer.mention.active = None;
+                        composer.mention.active =
+                            (!composer.mention_attachment_matches().is_empty()).then_some(0);
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
@@ -7110,8 +7570,8 @@ impl Composer {
     }
 
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+        let rows = self.mention_attachment_matches().len() + self.mention.results.len();
+        self.mention.active = crate::popover::menu_step(self.mention.active, rows, delta);
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
             self.mention_scroll.scroll_to_item(active);
@@ -7132,21 +7592,65 @@ impl Composer {
         cx.notify();
     }
 
+    /// Staged attachments that match the typed `@` query, pinned above file
+    /// results. Matching ignores case and spaces, so `@im`, `@image2` and
+    /// `@2` all find "Image 2", and `@note` finds "notes.md".
+    fn mention_attachment_matches(&self) -> Vec<AttachmentRow> {
+        let Some(token) = self.mention.token.as_ref() else {
+            return Vec::new();
+        };
+        let normalize = |text: &str| -> String {
+            text.chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
+        let wanted = normalize(&token.query);
+        let mut rows: Vec<_> = self
+            .staged()
+            .iter()
+            .filter_map(|att| {
+                let index = att.mention?;
+                let label = if att.image().is_some() {
+                    zeron_proto::attachment_mentions::image_label(index)
+                } else {
+                    att.name.clone()
+                };
+                normalize(&label).contains(&wanted).then(|| AttachmentRow {
+                    index,
+                    label,
+                    image: att.image().cloned(),
+                })
+            })
+            .collect();
+        rows.sort_by_key(|row| row.index);
+        rows
+    }
+
     fn accept_mention(&mut self, cx: &mut Context<Self>) {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
-        let Some((path, is_dir)) = self
-            .mention
-            .active
-            .and_then(|active| self.mention.results.get(active))
-            .map(|result| (result.path.clone(), result.is_dir))
-        else {
+        let rows = self.mention_attachment_matches();
+        let Some(active) = self.mention.active else {
             return;
         };
-        self.input.update(cx, |input, cx| {
-            input.replace_mention(token.range, &path, is_dir, cx)
-        });
+        if let Some(row) = rows.get(active) {
+            let link = zeron_proto::attachment_mentions::attachment_mention_link(
+                row.index,
+                row.image.is_none().then_some(row.label.as_str()),
+            );
+            self.input.update(cx, |input, cx| {
+                input.replace_mention_link(token.range, &link, cx)
+            });
+        } else if let Some(result) = self.mention.results.get(active - rows.len()) {
+            let (path, is_dir) = (result.path.clone(), result.is_dir);
+            self.input.update(cx, |input, cx| {
+                input.replace_mention(token.range, &path, is_dir, cx)
+            });
+        } else {
+            return;
+        }
         self.reset_mention(None, cx);
         cx.notify();
     }
@@ -7168,7 +7672,8 @@ impl Composer {
                 }),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
-        if self.mention.loading && self.mention.results.is_empty() {
+        let attachment_rows = self.mention_attachment_matches();
+        if self.mention.loading && self.mention.results.is_empty() && attachment_rows.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
                 "file-mention-loading",
                 theme,
@@ -7176,7 +7681,12 @@ impl Composer {
                 cx.entity_id(),
                 cx,
             ));
-        } else if let Some(error) = self.mention.error.clone() {
+        } else if let Some(error) = self
+            .mention
+            .error
+            .clone()
+            .filter(|_| attachment_rows.is_empty())
+        {
             card = card.child(
                 div()
                     .px(px(12.0))
@@ -7185,7 +7695,7 @@ impl Composer {
                     .text_color(theme.danger_muted)
                     .child(error),
             );
-        } else if self.mention.results.is_empty() {
+        } else if self.mention.results.is_empty() && attachment_rows.is_empty() {
             card = card.child(
                 div()
                     .px(px(12.0))
@@ -7199,8 +7709,53 @@ impl Composer {
                     }),
             );
         } else {
-            let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.mention.results.len());
-            for (ix, result) in self.mention.results.iter().enumerate() {
+            let mut rows: Vec<gpui::AnyElement> =
+                Vec::with_capacity(attachment_rows.len() + self.mention.results.len());
+            // Staged attachments stay pinned above every file result.
+            for (ix, row) in attachment_rows.iter().enumerate() {
+                let selected = self.mention.active == Some(ix);
+                let (icon, detail) = match &row.image {
+                    Some(image) => (
+                        img(image.clone())
+                            .size(px(16.0))
+                            .rounded(px(3.0))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        "Attached image",
+                    ),
+                    None => (
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(&row.label),
+                            theme.appearance,
+                        )
+                        .size(px(16.0))
+                        .into_any_element(),
+                        "Attached file",
+                    ),
+                };
+                rows.push(
+                    crate::popover::menu_row(
+                        theme,
+                        selected,
+                        format!("attachment-mention-result-{ix}"),
+                    )
+                    .id(("attachment-mention-result", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mention.active = Some(ix);
+                        this.accept_mention(cx);
+                    }))
+                    .child(crate::popover::completion_row_content(
+                        theme,
+                        icon,
+                        row.label.clone().into(),
+                        detail.into(),
+                    ))
+                    .into_any_element(),
+                );
+            }
+            let attachment_count = attachment_rows.len();
+            for (file_ix, result) in self.mention.results.iter().enumerate() {
+                let ix = attachment_count + file_ix;
                 let selected = self.mention.active == Some(ix);
                 let (directory, name) = match result.path.rsplit_once('/') {
                     Some((directory, name)) => (directory.to_string(), name.to_string()),
@@ -8139,6 +8694,7 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        self.attachment_drafts.remove(&self.current_key);
         let staged_appshots = self.appshots.remove(&self.current_key).unwrap_or_default();
         let mut staged = ordinary_staged.clone();
         staged.extend(
@@ -8158,6 +8714,12 @@ impl Composer {
             taken
         });
         let typed = text.clone();
+        // A chip for an attachment that is no longer staged must not leave as a link.
+        let attached: Vec<u32> = ordinary_staged
+            .iter()
+            .filter_map(|att| att.mention)
+            .collect();
+        let text = zeron_proto::attachment_mentions::demote_unattached_mentions(&text, &attached);
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -8244,30 +8806,20 @@ impl Composer {
         // rewrite instead of blanking into a reload skeleton.
         if queued_flow {
             for (upload_id, att) in upload_ids.iter().zip(&staged) {
-                attachments::seed_attachment_alias(
-                    &device_id,
-                    upload_id,
-                    &att.name,
-                    att.image.clone(),
-                );
+                attachments::seed_staged_alias(&device_id, upload_id, att);
                 if let Some(local) = local_device_id.as_deref()
                     && local != device_id
                 {
-                    attachments::seed_attachment_alias(
-                        local,
-                        upload_id,
-                        &att.name,
-                        att.image.clone(),
-                    );
+                    attachments::seed_staged_alias(local, upload_id, att);
                 }
             }
         }
         for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            attachments::seed_staged(&device_id, path, att);
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
             {
-                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_staged(local, path, att);
             }
         }
 
@@ -8420,9 +8972,9 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_staged(&seed_device, path, att);
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_staged(&device_id, path, att);
                         }
                     }
                     let appshot_paths: HashMap<String, String> = staged
@@ -8620,7 +9172,7 @@ impl Composer {
                     let queue_text = if !clean_queue_attachment_text {
                         content.as_str()
                     } else if queue_body.trim().is_empty() && !attachment_paths.is_empty() {
-                        attachments::ATTACHMENT_ONLY_TEXT
+                        attachments::attachment_only_text(&attachment_paths)
                     } else {
                         queue_body.as_str()
                     };
@@ -10909,6 +11461,9 @@ impl Render for Composer {
 mod modal_selection_tests;
 
 #[cfg(test)]
+mod attachment_chip_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11387,7 +11942,15 @@ mod tests {
             cx.update_window(handle.into(), |_, window, cx| {
                 window.draw(cx).clear();
                 assert!(input.read(cx).focus_handle.is_focused(window));
-                assert_eq!(input.read(cx).text(), "Keep this draft");
+                // An attached image is mentioned at the caret.
+                assert_eq!(
+                    input.read(cx).text(),
+                    if accepted {
+                        "Keep this draft [Image 1](zeron-image:1) "
+                    } else {
+                        "Keep this draft"
+                    }
+                );
             })
             .unwrap();
             assert_eq!(
@@ -11884,8 +12447,9 @@ mod tests {
             assert_eq!(input.projection.mentions.len(), 3);
             for (mention, display) in &input.projection.mentions {
                 let label = &input.projection.display[display.clone()];
-                assert!(label.starts_with(&format!("{MENTION_SIDE_PAD}{}", mention.prefix)));
-                assert!(label.ends_with(MENTION_SIDE_PAD));
+                let _ = mention;
+                assert!(label.starts_with(&format!("{MENTION_SIDE_PAD}{CHIP_ICON_SLOT}")));
+                assert!(label.ends_with(CHIP_TRAILING_PAD));
                 let shell = input.bounds_for_display_range(display.clone());
                 assert_eq!(shell.len(), 1);
                 assert!(shell[0].size.width > px(0.0));
@@ -12141,7 +12705,7 @@ mod tests {
     #[test]
     fn hidden_markdown_hit_testing_targets_visible_text() {
         let raw = "***café***\nactive";
-        let projection = TextProjection::rich(raw, Some(12..raw.len()));
+        let projection = TextProjection::rich(raw, Some(12..raw.len()), None);
         assert_eq!(projection.display_to_raw(0), 3);
         assert_eq!(
             &raw[projection.display_to_raw(0)..projection.display_to_raw(1)],
@@ -12159,7 +12723,7 @@ mod tests {
         assert_eq!(shown.graphemes(true).count(), 31);
         assert!(shown.ends_with(".rs"));
         let raw = local_file_link(&format!("src/{label}"), false);
-        let projected = TextProjection::rich(&raw, Some(0..raw.len()));
+        let projected = TextProjection::rich(&raw, Some(0..raw.len()), None);
         assert_eq!(projected.mentions[0].0.range, 0..raw.len());
         assert!(projected.mentions[0].0.path.ends_with(&label));
         assert!(projected.display.contains('…'));
@@ -12754,6 +13318,9 @@ mod tests {
             }
             input.set_text("**selected**", cx);
             input.selected_range = 2..10;
+            for outside in ["/tmp/file.rs", "../file.rs"] {
+                assert!(!input.insert_dropped_mention(outside, false, cx));
+            }
             assert!(input.insert_dropped_mention("src/main.rs", false, cx));
             assert_eq!(
                 input.text(),
@@ -12874,9 +13441,10 @@ mod tests {
         };
         let raw = format!("**café** {} end\nactive", invocation.link());
         let active = raw.rfind('\n').unwrap() + 1..raw.len();
-        let projection = TextProjection::rich(&raw, Some(active));
+        let projection = TextProjection::rich(&raw, Some(active), None);
         assert!(projection.display.starts_with("café"));
-        assert!(projection.display.contains("$Bla\u{00A0}Bla"));
+        assert!(projection.display.contains("Bla\u{00A0}Bla"));
+        assert!(!projection.display.contains('$'));
         assert_eq!(projection.mentions.len(), 1);
         let (link, display) = &projection.mentions[0];
         assert_eq!(projection.raw_to_display(link.range.start), display.start);
@@ -12890,7 +13458,8 @@ mod tests {
             Some(link.range.start)
         );
         let (sent, _) = sent_mention_display(&raw).unwrap();
-        assert!(sent.contains("$bla-bla:bla-bla"));
+        assert!(sent.contains("bla-bla:bla-bla"));
+        assert!(!sent.contains('$'));
         assert!(sent.starts_with("**café**"));
     }
 
@@ -13068,6 +13637,7 @@ mod tests {
         MentionTooltipTarget {
             range,
             path: path.into(),
+            attachment: None,
         }
     }
 
@@ -14085,21 +14655,17 @@ mod tests {
 
     #[test]
     fn dropped_mentions_are_separated_from_surrounding_text() {
+        let link = local_file_link("src/lib.rs", false);
         let (inserted, cursor_advance) =
-            dropped_file_mention("fixnow", 3..3, "src/lib.rs", false).expect("valid drop");
+            dropped_reference("fixnow", 3..3, &link).expect("valid drop");
         assert_eq!(inserted, " [lib.rs](zeron-file:src/lib.rs) ");
         assert_eq!(cursor_advance, inserted.len());
 
+        let link = local_file_link("src/components", true);
         let (inserted, cursor_advance) =
-            dropped_file_mention("fix now", 3..3, "src/components", true).expect("valid drop");
+            dropped_reference("fix now", 3..3, &link).expect("valid drop");
         assert_eq!(inserted, " [components](zeron-file:src/components/)");
         assert_eq!(cursor_advance, inserted.len() + 1);
-    }
-
-    #[test]
-    fn dropped_mentions_reject_paths_outside_the_workspace() {
-        assert!(dropped_file_mention("", 0..0, "/tmp/file.rs", false).is_none());
-        assert!(dropped_file_mention("", 0..0, "../file.rs", false).is_none());
     }
 
     #[test]
@@ -14134,6 +14700,8 @@ mod tests {
                 path: "foo/mod.rs".into(),
                 is_dir: false,
                 prefix: '@',
+                kind: ChipKind::File,
+                attachment: None,
             },
             FileMentionLink {
                 range: 0..0,
@@ -14141,6 +14709,8 @@ mod tests {
                 path: "bar/oomod.rs".into(),
                 is_dir: false,
                 prefix: '@',
+                kind: ChipKind::File,
+                attachment: None,
             },
         ];
         assert_eq!(
@@ -14156,7 +14726,7 @@ mod tests {
         let (link, chip) = &projection.mentions[0];
         assert_eq!(
             &projection.display[chip.clone()],
-            "\u{00A0}@composer.rs\u{00A0}"
+            format!("{MENTION_SIDE_PAD}{CHIP_ICON_SLOT}composer.rs{CHIP_TRAILING_PAD}")
         );
         assert_eq!(projection.display_to_raw(chip.start + 1), link.range.start);
         assert_eq!(projection.display_to_raw(chip.end - 1), link.range.end);
@@ -14188,8 +14758,10 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(
             &display[spans[0].range.clone()],
-            "\u{00A0}@composer.rs\u{00A0}"
+            format!("{MENTION_SIDE_PAD}{CHIP_ICON_SLOT}composer.rs{CHIP_TRAILING_PAD}")
         );
+        assert_eq!(spans[0].kind, ChipKind::File);
+        assert_eq!(spans[1].kind, ChipKind::Directory);
         assert!(!spans[0].is_dir);
         assert_eq!(spans[0].path.as_ref(), "src/composer.rs");
         assert!(spans[1].is_dir);
