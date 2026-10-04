@@ -6524,6 +6524,16 @@ impl Composer {
         self.failure.as_ref()
     }
 
+    /// The failure notice this draft renders. Chat-scoped failures render
+    /// only under their own chat; a global failure (no key) renders everywhere.
+    pub(crate) fn visible_failure(&self) -> Option<SharedString> {
+        self.failure.clone().filter(|_| {
+            self.failure_key
+                .as_ref()
+                .is_none_or(|key| *key == self.current_key)
+        })
+    }
+
     /// Show a dismissable failure chip for the current draft's session.
     pub(crate) fn show_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.failure = Some(message.into());
@@ -6534,7 +6544,8 @@ impl Composer {
     /// Run `stage` on the background executor — reading a file and converting
     /// a BMP are too slow for the UI thread — and add what it staged to the
     /// draft that is current now, even if the user has navigated away by the
-    /// time it finishes. Failures surface in that draft's failure notice.
+    /// time it finishes. Failures surface in that draft's failure notice, all
+    /// of them together so one refused file does not hide another.
     fn stage_in_background(
         &mut self,
         stage: impl FnOnce() -> Vec<Result<StagedAttachment, String>> + Send + 'static,
@@ -6545,14 +6556,16 @@ impl Composer {
             let results = cx.background_executor().spawn(async move { stage() }).await;
             this.update(cx, |this, cx| {
                 let mut staged = Vec::new();
+                let mut refused = Vec::new();
                 for result in results {
                     match result {
                         Ok(att) => staged.push(att),
-                        Err(message) => {
-                            this.failure = Some(message.into());
-                            this.failure_key = Some(key.clone());
-                        }
+                        Err(message) => refused.push(message),
                     }
+                }
+                if !refused.is_empty() {
+                    this.failure = Some(refused.join(" ").into());
+                    this.failure_key = Some(key.clone());
                 }
                 if !staged.is_empty() && !this.queue_edit_finishing {
                     this.adopt_staged_attachments(key, staged, cx);
@@ -10653,13 +10666,7 @@ impl Render for Composer {
         };
         let expanded = self.expanded_mode;
 
-        // Chat-scoped failures render only under their own chat; a global
-        // failure (no key) renders everywhere.
-        let failure = self.failure.clone().filter(|_| {
-            self.failure_key
-                .as_ref()
-                .is_none_or(|key| *key == self.current_key)
-        });
+        let failure = self.visible_failure();
         // Composer honesty: when the target's delivery path is degraded, say
         // UP FRONT that a send will queue (a durable local write delivered on
         // reconnect) instead of letting the button imply instant delivery.
