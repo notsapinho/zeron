@@ -238,6 +238,43 @@ fn attachments_without_chips_are_left_alone(cx: &mut gpui::TestAppContext) {
     assert_eq!(staged_names(&handle, cx), ["image.png"]);
 }
 
+fn tiled_names(
+    handle: &gpui::WindowHandle<Composer>,
+    cx: &mut gpui::TestAppContext,
+) -> Vec<String> {
+    handle
+        .read_with(cx, |composer, cx| {
+            composer
+                .tiled_attachments(cx)
+                .iter()
+                .map(|att| att.name.clone())
+                .collect()
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn only_attachments_without_a_chip_get_a_tile(cx: &mut gpui::TestAppContext) {
+    let (_dir, handle) = composer_focus_window(cx);
+    paste_images(&handle, cx, 2);
+    // The chips stand in for the staged images: no tile repeats them.
+    assert_eq!(staged_names(&handle, cx).len(), 2);
+    assert!(tiled_names(&handle, cx).is_empty());
+    handle
+        .update(cx, |composer, _, _| {
+            let key = composer.current_key.clone();
+            composer
+                .attachments
+                .entry(key)
+                .or_default()
+                .push(crate::attachments::stage_clipboard_image(png()));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // One with no chip keeps its tile, the only handle it has.
+    assert_eq!(tiled_names(&handle, cx), ["image.png"]);
+}
+
 #[gpui::test]
 fn undoing_a_thumbnail_removal_restores_image_and_chip(cx: &mut gpui::TestAppContext) {
     let (_dir, handle) = composer_focus_window(cx);

@@ -103,7 +103,9 @@ pub(crate) fn chip_icon(
 }
 
 /// Paint a chip like the transcript's file badges: a soft rounded pill whose
-/// first row starts with the icon on a small well.
+/// first row starts with the icon on a small well. Callers center `chip` on
+/// the line box: Geist's cap height sits exactly on its middle (ascent 1005,
+/// descent 295, cap 710 per 1000 units), so a centered pill centers the label.
 pub(crate) fn paint_chip(
     window: &mut Window,
     chip: Bounds<Pixels>,
@@ -179,12 +181,11 @@ pub(crate) fn chip_text(
         |_, _, _| (),
         move |_, _, window, cx| {
             for (span, icon) in spans.iter().zip(&icons) {
-                for (row, mut rect) in
+                for (row, rect) in
                     crate::markdown::render::range_rects(&layout, &span.range, 0.0, 2.0)
                         .into_iter()
                         .enumerate()
                 {
-                    rect.origin.y += px(1.0);
                     paint_chip(window, rect, (row == 0).then_some(icon), &theme, cx);
                 }
             }
