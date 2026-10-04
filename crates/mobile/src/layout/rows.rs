@@ -18,6 +18,7 @@ use zeron_markdown::parser::{IncrementalParser, TopBlock};
 use zeron_text::WhiteSpace;
 
 use super::display::{ColorRole, DisplayBuilder, FadeEdge, TextRun, WidgetKind};
+use super::file_icons::file_icon_asset;
 use super::markdown::{Ctx, PBlock, PText, Px, place, place_text, prepare_block, prepare_plain};
 use super::style::{Family, TYPE, Weight};
 use super::tools::{ThoughtState, ToolGroup, place_tools};
@@ -69,6 +70,8 @@ pub(crate) fn next_version() -> u64 {
 pub(crate) struct UserBubble {
     pub text: PText,
     pub images: Vec<String>,
+    /// Non-image attachments (desktop-sent ZIPs, docs): icon asset + name.
+    pub files: Vec<(String, PText)>,
     pub pending: bool,
     pub expanded: bool,
     pub more: PText,
@@ -134,6 +137,7 @@ pub(crate) mod geom {
     pub const BUBBLE_FOLD_LINES: usize = 8;
     pub const BUBBLE_FOLD_SHOW: usize = 6;
     pub const THUMB: f32 = 76.0;
+    pub const FILE_PILL: f32 = 32.0;
     pub const CHIP_LINE: f32 = 32.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
@@ -476,14 +480,26 @@ impl RowBuilder {
         let key = row_key(&format!("{id}#u"));
         // Shared parser: strips the image trailer *and* hidden Appshot context.
         let parsed = zeron_client::attachments::parse_user_message(content);
-        let body = parsed.text.as_str();
-        let images: Vec<String> = parsed.images.into_iter().map(|i| i.path).collect();
+        // Attachment chips read as their plain label (`Image 1`, `notes.zip`).
+        let body = zeron_proto::attachment_mentions::attachment_mention_prompt(&parsed.text);
         let (size, lh) = TYPE.body;
         let style = ctx.typo.style(Family::Sans, Weight::Regular, false, size);
         let lh = ctx.typo.px(lh);
         let text = prepare_user_text(ctx, body.trim(), style, lh);
         let (msize, mlh) = TYPE.small;
         let mstyle = ctx.typo.style(Family::Sans, Weight::Medium, false, msize);
+        // Only images go to image widgets; other files (desktop-sent ZIPs)
+        // get a name pill, never an image load.
+        let (images, others): (Vec<_>, Vec<_>) =
+            parsed.images.into_iter().partition(|i| zeron_proto::attachment_mentions::is_image_path(&i.path));
+        let images = images.into_iter().map(|i| i.path).collect();
+        let files = others
+            .iter()
+            .map(|f| {
+                let name = zeron_proto::attachment_mentions::attachment_display_name(&f.name);
+                (file_icon_asset(name), prepare_plain(ctx, name, mstyle, ctx.typo.px(mlh), ColorRole::Text, WhiteSpace::Pre))
+            })
+            .collect();
         let expanded = self.expanded.contains(&key);
         let more = prepare_plain(
             ctx,
@@ -501,11 +517,12 @@ impl RowBuilder {
             content: Content::User(UserBubble {
                 text,
                 images,
+                files,
                 pending,
                 expanded,
                 more,
             }),
-            copy_text: body.to_owned(),
+            copy_text: body,
         }
     }
 
@@ -690,17 +707,35 @@ fn place_user(u: &UserBubble, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut 
     let more_h = if folds { u.more.lh + px.v(4.0) } else { 0.0 };
     let bubble_w = if folds { max_w } else { stats.max_line_width.ceil() + pad_x * 2.0 };
     let bubble_h = if stats.line_count == 0 { 0.0 } else { text_h + more_h + pad_y * 2.0 };
-    let thumbs_h = if u.images.is_empty() { 0.0 } else { px.v(THUMB) + if bubble_h > 0.0 { px.v(8.0) } else { 0.0 } };
+    let side = px.v(THUMB);
+    let gap = px.v(6.0);
+    let pill_h = px.v(FILE_PILL);
+    // Thumbnails row, then one pill per file, stacked above the bubble.
+    let files_y = if u.images.is_empty() { 0.0 } else { side + gap };
+    let attach_h = (files_y + u.files.len() as f32 * (pill_h + gap) - gap).max(0.0);
+    let thumbs_h = if attach_h > 0.0 { attach_h + if bubble_h > 0.0 { px.v(8.0) } else { 0.0 } } else { 0.0 };
     let h = thumbs_h + bubble_h;
     let Some(out) = out else { return h };
     // Thumbnails right-aligned above the bubble.
-    let side = px.v(THUMB);
-    let gap = px.v(6.0);
     let mut tx = x + cw - side;
     for img in u.images.iter().rev() {
         out.fill(tx, y, side, side, px.v(12.0), ColorRole::ChipBackground);
         out.widget(WidgetKind::Image { reference: img.clone() }, (tx, y, side, side), None);
         tx -= side + gap;
+    }
+    // Files: right-aligned icon + name pills; long names fade at the edge.
+    let is = px.v(16.0);
+    let inset = px.v(10.0) + is + px.v(8.0);
+    let chrome = inset + px.v(12.0);
+    let name_w = (max_w - chrome).max(1.0);
+    let mut fy = y + files_y;
+    for (icon, name) in &u.files {
+        let pw = chrome + name.p.max_content_width().ceil().min(name_w);
+        let fx = x + cw - pw;
+        out.fill(fx, fy, pw, pill_h, px.v(12.0), ColorRole::ChipBackground);
+        out.widget(WidgetKind::Icon { name: icon.clone(), color: ColorRole::TextSoft }, (fx + px.v(10.0), fy + (pill_h - is) / 2.0, is, is), None);
+        place_text_lines(name, fx + inset, fy + (pill_h - name.lh) / 2.0, name_w, 1, px, out);
+        fy += pill_h + gap;
     }
     if bubble_h > 0.0 {
         let bx = x + cw - bubble_w;
@@ -740,7 +775,7 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
     }
     match content {
         Content::Block(b) => block(b),
-        Content::User(u) => u.text.p.heap_bytes() + u.more.p.heap_bytes(),
+        Content::User(u) => u.text.p.heap_bytes() + u.more.p.heap_bytes() + u.files.iter().map(|(_, n)| n.p.heap_bytes()).sum::<usize>(),
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),

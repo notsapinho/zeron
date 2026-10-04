@@ -488,6 +488,32 @@ fn user_attachments_render_as_images_not_trailer_text() {
 }
 
 #[test]
+fn synced_file_attachments_render_as_name_pills_not_images() {
+    // A desktop send mixing an image and ZIPs (one still a queued-upload ref),
+    // with composer chips in the prompt.
+    let mut w = worker(390.0);
+    let text = "Compare [Image 1](zeron-image:1) with [notes.zip](zeron-attachment:2)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Image_1.png\n- /tmp/uploads/ab12cd34-notes.zip\n- pending://up-3/logs.zip".to_owned();
+    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    let images: Vec<&str> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Image { reference } => Some(reference.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, vec!["/tmp/uploads/ab12cd34-Image_1.png"]);
+    let icons = d.widgets.iter().filter(|w| matches!(&w.kind, display::WidgetKind::Icon { name, .. } if name == "fileicon-files-compressed")).count();
+    assert_eq!(icons, 2);
+    assert!(d.text.contains("notes.zip") && d.text.contains("logs.zip"), "{}", d.text);
+    assert!(!d.text.contains("ab12cd34-"), "{}", d.text);
+    assert!(d.text.contains("Compare Image 1 with notes.zip"), "{}", d.text);
+    assert!(!d.text.contains("zeron-"), "{}", d.text);
+}
+
+#[test]
 fn folded_user_message_fades_its_last_line() {
     let mut w = worker(390.0);
     let long = (0..40).map(|i| format!("line {i} of a long pasted prompt")).collect::<Vec<_>>().join("\n");

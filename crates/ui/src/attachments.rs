@@ -68,14 +68,7 @@ pub fn is_image_path(path: &str) -> bool {
     format_by_extension(Path::new(path)).is_some()
 }
 
-/// The file name to show for an attachment ref: uploads are stored as
-/// `{id8}-{name}`, and the prefix is not part of the name.
-pub fn attachment_display_name(name: &str) -> &str {
-    match name.split_once('-') {
-        Some((id, rest)) if id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()) => rest,
-        _ => name,
-    }
-}
+pub use zeron_proto::attachment_mentions::attachment_display_name;
 
 /// Whether `mention` is the chip for the attachment at `path`. Images match
 /// by draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by name as the

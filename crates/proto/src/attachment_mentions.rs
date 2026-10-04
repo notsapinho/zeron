@@ -50,6 +50,27 @@ pub fn image_index_from_name(name: &str) -> Option<u32> {
     digits.parse().ok().filter(|index| *index > 0)
 }
 
+/// Whether an attachment ref names an image, as opposed to any other file.
+/// The same extensions the desktop decodes (`format_by_extension`), so every
+/// client shows a given attachment the same way.
+pub fn is_image_path(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff"
+        )
+    })
+}
+
+/// The file name to show for an attachment ref: uploads are stored as
+/// `{id8}-{name}`, and the prefix is not part of the name.
+pub fn attachment_display_name(name: &str) -> &str {
+    match name.split_once('-') {
+        Some((id, rest)) if id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()) => rest,
+        _ => name,
+    }
+}
+
 /// Undo [`crate::file_mentions::escape_mention_label`], rejecting any label
 /// that is not exactly what escaping produces.
 fn unescape_label(raw: &str) -> Option<String> {
@@ -255,5 +276,15 @@ mod tests {
         ] {
             assert_eq!(image_index_from_name(name), index, "{name}");
         }
+    }
+
+    #[test]
+    fn attachment_refs_split_images_from_files() {
+        assert!(is_image_path("/uploads/ab12cd34-shot.PNG"));
+        assert!(is_image_path("pending://u1/Image_1.jpeg"));
+        assert!(!is_image_path("/uploads/ab12cd34-notes.zip"));
+        assert!(!is_image_path("/uploads/png"));
+        assert_eq!(attachment_display_name("ab12cd34-notes.zip"), "notes.zip");
+        assert_eq!(attachment_display_name("my-notes.zip"), "my-notes.zip");
     }
 }
