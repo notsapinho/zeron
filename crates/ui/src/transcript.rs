@@ -1324,8 +1324,9 @@ pub fn rows_for_entry(
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
         let body = agent_message_display(&body);
-        // Chips stand in for their attachments: those leave the strip, and an
-        // image chip carries its upload's path so a click can open it.
+        // Chips stand in for their attachments: those leave the strip, and a
+        // chip carries its upload's path for its progress and, for an image,
+        // a click opening it.
         let chips = zeron_proto::attachment_mentions::attachment_mentions(&body);
         let mut attachments = parsed.attachments;
         let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
@@ -1335,16 +1336,14 @@ pub fn rows_for_entry(
         for span in &mut mentions {
             let Some(chip) = chips
                 .iter()
-                .find(|chip| chip.is_image && Some(chip.index) == span.attachment)
+                .find(|chip| Some(chip.index) == span.attachment)
             else {
                 continue;
             };
-            if let Some(att) = attachments
+            span.upload = attachments
                 .iter()
                 .find(|att| crate::attachments::chip_names_attachment(chip, &att.path))
-            {
-                span.path = att.path.clone().into();
-            }
+                .map(|att| att.path.clone().into());
         }
         attachments.retain(|att| {
             att.appshot.is_some()
@@ -5501,8 +5500,7 @@ impl Transcript {
                 let chipped = mentions
                     .iter()
                     .filter(|span| span.kind == crate::composer::ChipKind::Image)
-                    .map(|span| span.path.to_string())
-                    .filter(|path| !path.is_empty());
+                    .filter_map(|span| span.upload.as_ref().map(|path| path.to_string()));
                 for path in attachments
                     .iter()
                     .map(|att| att.path.clone())
@@ -5680,16 +5678,6 @@ impl Transcript {
         self.attachment_retries.insert(key, task);
     }
 
-    /// The inside of a user bubble: the prompt text, clipped to
-    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander chevron for
-    /// prompts past the cap. Returns the bubble's children in order.
-    ///
-    /// The collapsed form clips a normally-laid-out text element at exactly
-    /// five line boxes. Do not use gpui's `line_clamp` here: on an auto-width
-    /// flex item it answers intrinsic-width probes with the truncated layout,
-    /// collapsing the bubble to min-content width (one character per line).
-    /// A plain height clip preserves the original bubble width calculation and
-    /// never feeds measured layout back into the virtualized list.
     /// Open a sent image chip's upload full size, as its thumbnail did. An
     /// image still loading opens on a later click.
     fn open_chip_image(
@@ -5711,6 +5699,109 @@ impl Transcript {
         }
     }
 
+    /// Whether an attachment ref is still crossing to the chat's host, and
+    /// how far along it is. Two ref shapes mean "still crossing": the queued
+    /// flow's `pending://` (bytes ship engine-side after the send; the host
+    /// rewrites the ref to an absolute path once they land and the run
+    /// starts) and the legacy echo's synthetic `pending/`. Percent sources, in
+    /// order: this attachment's own relay transfer (`WatchTransfers`, by the
+    /// uploadId its ref names — the leg that actually takes time), else the
+    /// send-wide staging/legacy upload percent. Neither → no number, so a
+    /// ring never shows one that isn't a real transfer position (2026-08-20
+    /// report: the staging-only percent blinked out in ~100ms and lied about
+    /// the slow part).
+    fn upload_status(&self, path: &str, cx: &Context<Self>) -> (bool, Option<u8>) {
+        let sending = path.starts_with("pending://") || path.starts_with("pending/");
+        let upload_id = path
+            .strip_prefix("pending://")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(id, _)| id);
+        let percent = upload_id
+            .and_then(|id| self.state.read(cx).transfer_percent(id))
+            .or_else(|| {
+                sending
+                    .then(|| self.state.read(cx).upload_progress_percent())
+                    .flatten()
+            });
+        (sending, percent)
+    }
+
+    /// What a sent bubble's attachment chips show beyond their label: the
+    /// progress of an upload still crossing to the host in place of the icon
+    /// (the strip's thumbnails used to carry it), a warning for an image that
+    /// can't be read back, and a click target opening a loaded image.
+    fn chip_overlays(
+        &mut self,
+        row_id: &SharedString,
+        mentions: &[crate::composer::SentMentionSpan],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<ChipOverlay> {
+        use crate::attachments::AttachmentSnapshot;
+        if mentions.iter().all(|span| span.upload.is_none()) {
+            return Vec::new();
+        }
+        let device_ids = self.attachment_device_ids(cx);
+        let mut overlays = Vec::new();
+        for (ix, span) in mentions.iter().enumerate() {
+            let Some(upload) = &span.upload else {
+                continue;
+            };
+            let (sending, percent) = self.upload_status(upload, cx);
+            let mut status = sending.then(|| match percent {
+                Some(pct) => crate::loaders::upload_progress_arc(
+                    pct,
+                    CHIP_STATUS_SIZE,
+                    theme.text_muted.opacity(0.35),
+                    theme.text,
+                ),
+                None => crate::loaders::mini_glyph_spinner(
+                    format!("chip-sending-{row_id}-{ix}"),
+                    2.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element(),
+            });
+            let mut open = None;
+            if span.kind == crate::composer::ChipKind::Image {
+                // Loading here keeps the image ready for a click, as the
+                // strip's thumbnail did.
+                match self.attachment_state(&device_ids, upload, None, cx) {
+                    AttachmentSnapshot::Loaded(_) => open = Some(upload.clone()),
+                    AttachmentSnapshot::Error { .. } if !sending => {
+                        status = Some(
+                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                                .size(px(CHIP_STATUS_SIZE - 2.0))
+                                .text_color(theme.text_muted)
+                                .into_any_element(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if open.is_some() || status.is_some() {
+                overlays.push(ChipOverlay {
+                    range: span.range.clone(),
+                    open,
+                    status,
+                });
+            }
+        }
+        overlays
+    }
+
+    /// The inside of a user bubble: the prompt text, clipped to
+    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander chevron for
+    /// prompts past the cap. Returns the bubble's children in order.
+    ///
+    /// The collapsed form clips a normally-laid-out text element at exactly
+    /// five line boxes. Do not use gpui's `line_clamp` here: on an auto-width
+    /// flex item it answers intrinsic-width probes with the truncated layout,
+    /// collapsing the bubble to min-content width (one character per line).
+    /// A plain height clip preserves the original bubble width calculation and
+    /// never feeds measured layout back into the virtualized list.
     fn render_user_body(
         &mut self,
         row_id: &SharedString,
@@ -5721,18 +5812,7 @@ impl Transcript {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Load image chips' uploads ahead of a click, as the strip did.
-        let chip_images: Vec<SharedString> = mentions
-            .iter()
-            .filter(|span| span.kind == crate::composer::ChipKind::Image && !span.path.is_empty())
-            .map(|span| span.path.clone())
-            .collect();
-        if !chip_images.is_empty() {
-            let device_ids = self.attachment_device_ids(cx);
-            for path in &chip_images {
-                self.attachment_state(&device_ids, path, None, cx);
-            }
-        }
+        let chip_overlays = self.chip_overlays(row_id, &mentions, theme, cx);
         let fold = self.user_folds.get(row_id).copied().unwrap_or_default();
         let expanded = fold.open.unwrap_or(false);
         let line_height =
@@ -5804,6 +5884,7 @@ impl Transcript {
                 theme,
                 measured_h.clone(),
                 cx.entity_id(),
+                chip_overlays,
                 Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
                     this.open_chip_image(path, window, cx);
                 })),
@@ -6196,32 +6277,10 @@ impl Transcript {
             }
             let state = self.attachment_state(&device_ids, &att.path, None, cx);
             // The in-flight send's progress belongs ON the thumbnail
-            // (2026-08-18 user request). Two ref shapes mean "still
-            // crossing": the queued flow's `pending://` (bytes ship
-            // engine-side after the send; the host rewrites the ref to an
-            // absolute path once they land and the run starts) and the
-            // legacy echo's synthetic `pending/`. Percent sources, in order:
-            // this attachment's own relay transfer (`WatchTransfers`, by the
-            // uploadId its ref names — the leg that actually takes time),
-            // else the send-wide staging/legacy upload percent. Neither → the
-            // indeterminate spinner (staged-but-waiting, retry backoff, or
-            // committed-awaiting-rewrite), so the ring never shows a number
-            // that isn't a real transfer position (2026-08-20 report: the
-            // staging-only percent blinked out in ~100ms and lied about the
-            // slow part).
-            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
-            let upload_id = att
-                .path
-                .strip_prefix("pending://")
-                .and_then(|rest| rest.split_once('/'))
-                .map(|(id, _)| id);
-            let uploading = upload_id
-                .and_then(|id| self.state.read(cx).transfer_percent(id))
-                .or_else(|| {
-                    sending
-                        .then(|| self.state.read(cx).upload_progress_percent())
-                        .flatten()
-                });
+            // (2026-08-18 user request). No percent → the indeterminate
+            // spinner (staged-but-waiting, retry backoff, or
+            // committed-awaiting-rewrite); see `upload_status`.
+            let (sending, uploading) = self.upload_status(&att.path, cx);
             if let Some(appshot) = &att.appshot {
                 let has_image = matches!(&state, AttachmentSnapshot::Loaded(_));
                 let theme = Theme::of(cx).clone();
@@ -8025,6 +8084,7 @@ fn user_bubble_text(
     theme: &Theme,
     measured_h: Rc<Cell<f32>>,
     entity_id: gpui::EntityId,
+    overlays: Vec<ChipOverlay>,
     open_image: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
 ) -> AnyElement {
     // Split runs at chip boundaries (spans are in order): body text keeps the
@@ -8086,16 +8146,16 @@ fn user_bubble_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    // Image chips paired with their upload open it, as the thumbnails did.
-    let image_chips: Vec<(Range<usize>, SharedString)> = mentions
-        .iter()
-        .filter(|span| span.kind == crate::composer::ChipKind::Image && !span.path.is_empty())
-        .map(|span| (span.range.clone(), span.path.clone()))
-        .collect();
     let chip_layout = layout.clone();
-    let chip_icons: Vec<crate::composer::ChipIcon> = mentions
+    // A chip showing a status paints it over its icon well instead.
+    let chip_icons: Vec<Option<crate::composer::ChipIcon>> = mentions
         .iter()
-        .map(|span| crate::composer::chip_icon(span.kind, &span.path, theme.appearance))
+        .map(|span| {
+            (!overlays
+                .iter()
+                .any(|overlay| overlay.status.is_some() && overlay.range == span.range))
+            .then(|| crate::composer::chip_icon(span.kind, &span.path, theme.appearance))
+        })
         .collect();
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
@@ -8108,7 +8168,7 @@ fn user_bubble_text(
                     .into_iter()
                     .enumerate()
                 {
-                    let icon = (row == 0).then_some(icon);
+                    let icon = icon.as_ref().filter(|_| row == 0);
                     crate::composer::paint_chip(window, rect, icon, &sel_theme, cx);
                 }
             }
@@ -8142,38 +8202,51 @@ fn user_bubble_text(
         .child(underlay)
         .child(styled)
         .into_any_element();
-    if image_chips.is_empty() {
+    if overlays.is_empty() {
         return text;
     }
-    ImageChipTargets {
-        id: format!("{row_id}-image-chips").into(),
+    ChipOverlays {
+        id: format!("{row_id}-chip-overlays").into(),
         child: text,
         layout: chip_layout,
-        chips: image_chips,
+        overlays,
         open: open_image,
+        well: crate::file_icons::well_bg(theme),
     }
     .into_any_element()
 }
 
-/// Wraps a sent bubble's text with a pointer target over each image chip; a
-/// click opens the image full size. Targets follow the shaped text, so a chip
-/// that wraps gets one per row.
-struct ImageChipTargets {
+/// The upload status painted in a sent chip's icon well.
+const CHIP_STATUS_SIZE: f32 = 14.0;
+
+/// One sent chip's extras, laid over its pill: a status in place of its icon
+/// and, for a loaded image, a click target opening it full size.
+struct ChipOverlay {
+    range: Range<usize>,
+    open: Option<SharedString>,
+    status: Option<AnyElement>,
+}
+
+/// Wraps a sent bubble's text with its chips' overlays. They follow the
+/// shaped text, so a chip that wraps gets a click target per row; its status
+/// sits on the first row, where the icon would be.
+struct ChipOverlays {
     id: SharedString,
     child: AnyElement,
     layout: gpui::TextLayout,
-    chips: Vec<(Range<usize>, SharedString)>,
+    overlays: Vec<ChipOverlay>,
     open: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
+    well: gpui::Hsla,
 }
 
-impl IntoElement for ImageChipTargets {
+impl IntoElement for ChipOverlays {
     type Element = Self;
     fn into_element(self) -> Self {
         self
     }
 }
 
-impl gpui::Element for ImageChipTargets {
+impl gpui::Element for ChipOverlays {
     type RequestLayoutState = ();
     type PrepaintState = Vec<AnyElement>;
 
@@ -8206,11 +8279,32 @@ impl gpui::Element for ImageChipTargets {
     ) -> Vec<AnyElement> {
         self.child.prepaint(window, cx);
         let mut targets = Vec::new();
-        for (index, (range, path)) in self.chips.iter().enumerate() {
-            for (part, rect) in render::range_rects(&self.layout, range, 0.0, 2.0)
-                .into_iter()
-                .enumerate()
-            {
+        for (index, overlay) in self.overlays.iter_mut().enumerate() {
+            let rects = render::range_rects(&self.layout, &overlay.range, 0.0, 2.0);
+            if let (Some(status), Some(first)) = (overlay.status.take(), rects.first()) {
+                // Matches `paint_chip`'s icon well.
+                let side = first.size.height - px(2.0);
+                let mut well = div()
+                    .size(side)
+                    .rounded(px(4.0))
+                    .bg(self.well)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(status)
+                    .into_any_element();
+                well.prepaint_as_root(
+                    first.origin + point(px(1.0), px(1.0)),
+                    size(side, side).map(gpui::AvailableSpace::Definite),
+                    window,
+                    cx,
+                );
+                targets.push(well);
+            }
+            let Some(path) = overlay.open.clone() else {
+                continue;
+            };
+            for (part, rect) in rects.into_iter().enumerate() {
                 let open = self.open.clone();
                 let path = path.clone();
                 let mut target = div()
@@ -14260,6 +14354,82 @@ mod tests {
     /// row carries the projected display text plus spans, while ordinary
     /// prompts keep the empty-spans fast path. The row version derives from
     /// the RAW text either way, so projection never perturbs the diff key.
+    /// A chip whose upload is still crossing to the host shows its progress
+    /// in place of its icon, as the strip's thumbnail did; once the bytes
+    /// land (the ref is rewritten to a local path) the icon comes back.
+    #[gpui::test]
+    fn sent_chips_show_upload_progress_until_their_bytes_land(cx: &mut gpui::TestAppContext) {
+        use zeron_proto::attachment_mentions::attachment_mention_link;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.apply_transfers(vec![zeron_proto::TransferProgress {
+                upload_id: "att-1".into(),
+                file_name: "Image 1.png".into(),
+                done: 430,
+                total: 1_000,
+            }])
+        });
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        let body = format!(
+            "compare {} with {} and {}",
+            attachment_mention_link(1, None),
+            attachment_mention_link(2, Some("notes.md")),
+            attachment_mention_link(3, Some("done.md")),
+        );
+        let raw = crate::attachments::with_attachments(
+            &body,
+            &[
+                "pending://att-1/Image 1.png".to_string(),
+                "pending://att-2/notes.md".to_string(),
+                "/uploads/ef56ab78-done.md".to_string(),
+            ],
+        );
+        let mut entry = assistant("u5", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &raw)];
+        let rows = rows_for_entry(&entry, true, false, &mut parse);
+        let RowKind::User {
+            mentions,
+            attachments,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected a user row");
+        };
+        assert!(attachments.is_empty());
+        let mentions = mentions.clone();
+        transcript.update(cx, |transcript, cx| {
+            let overlays = transcript.chip_overlays(&"u5".into(), &mentions, &Theme::dark(), cx);
+            // The image (43% across) and the file still crossing show a
+            // status; the landed file shows its icon.
+            assert_eq!(
+                overlays
+                    .iter()
+                    .map(|overlay| (overlay.range.clone(), overlay.status.is_some()))
+                    .collect::<Vec<_>>(),
+                [
+                    (mentions[0].range.clone(), true),
+                    (mentions[1].range.clone(), true)
+                ]
+            );
+            assert_eq!(
+                transcript.upload_status("pending://att-1/Image 1.png", cx),
+                (true, Some(43))
+            );
+            assert_eq!(
+                transcript.upload_status("/uploads/ef56ab78-done.md", cx),
+                (false, None)
+            );
+        });
+    }
+
     /// A sent message with image, file-attachment and workspace-file chips
     /// reads as chips in the bubble; only attachments without a chip stay in
     /// the strip above.
@@ -14310,7 +14480,7 @@ mod tests {
             .collect();
         assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
         // Chips stand in for their attachments: only the unchipped image is
-        // left in the strip, and the image chip carries its upload to open.
+        // left in the strip, and each attachment chip carries its upload.
         assert_eq!(
             attachments
                 .iter()
@@ -14318,7 +14488,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/uploads/0a1b2c3d-Image_3.png"]
         );
-        assert_eq!(mentions[0].path.as_ref(), "/uploads/ab12cd34-Image_1.png");
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|m| m.upload.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("/uploads/ab12cd34-Image_1.png"),
+                Some("/uploads/ef56ab78-notes.md"),
+                None
+            ]
+        );
 
         // A files-only send hides the placeholder body.
         let raw = crate::attachments::with_attachments("", &["/uploads/ef56ab78-notes.md".into()]);

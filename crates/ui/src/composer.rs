@@ -1455,11 +1455,12 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
 pub struct SentMentionSpan {
     pub range: Range<usize>,
     /// Full workspace-relative path (labels can be shortened to basenames).
-    /// An image chip's is empty until the transcript pairs it with its upload.
     pub path: SharedString,
     pub kind: ChipKind,
     /// The draft number of an attachment chip.
     pub attachment: Option<u32>,
+    /// The upload an attachment chip names, once the transcript pairs them.
+    pub upload: Option<SharedString>,
 }
 
 /// Cheap probe: whether `raw` could hold a file, skill or attachment chip.
@@ -1495,6 +1496,7 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
             )),
             kind: link.kind,
             attachment: link.attachment,
+            upload: None,
         })
         .collect();
     Some((projection.display, spans))
