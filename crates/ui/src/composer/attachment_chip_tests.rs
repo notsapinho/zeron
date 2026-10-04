@@ -585,3 +585,138 @@ fn file_chips_use_the_file_theme_to_tell_formats_apart() {
         ChipIcon::Glyph(_)
     ));
 }
+
+/// Put a queued message carrying `Image 1` and `notes.md` into the composer,
+/// as an acquired edit does.
+fn begin_queued_edit(
+    handle: &gpui::WindowHandle<Composer>,
+    cx: &mut gpui::TestAppContext,
+    dir: &tempfile::TempDir,
+) {
+    let notes = crate::attachments::stage_file(&write_file(dir, "notes.md")).unwrap();
+    let image = crate::attachments::stage_png_bytes("ab12cd34-Image_1.png".into(), Vec::new());
+    let text = format!(
+        "summarize {} and {}",
+        attachment_mention_link(1, None),
+        attachment_mention_link(2, Some("notes.md"))
+    );
+    handle
+        .update(cx, |composer, _, cx| {
+            composer.editing_queued = Some("row".into());
+            composer.swap_in_queued_draft(text, vec![image, notes], Vec::new(), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn remove_chip(handle: &gpui::WindowHandle<Composer>, cx: &mut gpui::TestAppContext, index: u32) {
+    edit(handle, cx, move |input| {
+        let chip = zeron_proto::attachment_mentions::attachment_mentions(input.text())
+            .into_iter()
+            .find(|chip| chip.index == index)
+            .unwrap();
+        (chip.range, String::new())
+    });
+}
+
+#[gpui::test]
+fn a_queued_edit_keeps_its_chips_live_and_deleting_one_unstages_it(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    begin_queued_edit(&handle, cx, &dir);
+    // The restored attachments (named as uploaded) take the numbers of the
+    // chips naming them.
+    assert_eq!(
+        staged_names(&handle, cx),
+        ["ab12cd34-Image_1.png", "notes.md"]
+    );
+    handle
+        .read_with(cx, |composer, cx| {
+            assert_eq!(composer.input.read(cx).projection.mentions.len(), 2);
+        })
+        .unwrap();
+
+    // A file attached during the edit is numbered after the message's chips.
+    add_file(&handle, cx, write_file(&dir, "logs.zip"));
+    assert_eq!(
+        staged_names(&handle, cx),
+        ["ab12cd34-Image_1.png", "notes.md", "logs.zip"]
+    );
+    assert_eq!(
+        attachment_mention_indices(&text(&handle, cx)),
+        vec![1, 2, 3]
+    );
+
+    // Deleting its chip unstages it, so saving would not upload it...
+    remove_chip(&handle, cx, 3);
+    assert_eq!(
+        staged_names(&handle, cx),
+        ["ab12cd34-Image_1.png", "notes.md"]
+    );
+    // ...and undo brings it back.
+    handle
+        .update(cx, |composer, window, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.undo(&Undo, window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        staged_names(&handle, cx),
+        ["ab12cd34-Image_1.png", "notes.md", "logs.zip"]
+    );
+
+    // A restored file's chip deletes the same way, and the saved text never
+    // carries a chip for an attachment that is not saved with it.
+    remove_chip(&handle, cx, 2);
+    append(
+        &handle,
+        cx,
+        &format!(" {}", attachment_mention_link(9, None)),
+    );
+    assert_eq!(
+        staged_names(&handle, cx),
+        ["ab12cd34-Image_1.png", "logs.zip"]
+    );
+    handle
+        .read_with(cx, |composer, cx| {
+            let saved = composer.queue_edit_text(cx);
+            assert_eq!(attachment_mention_indices(&saved), vec![1, 3]);
+            assert!(saved.ends_with(" Image 9"), "{saved:?}");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn leaving_a_queued_edit_restores_the_draft_and_its_numbering(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    handle
+        .update(cx, |composer, _, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("draft ", cx));
+        })
+        .unwrap();
+    paste_images(&handle, cx, 1);
+    let draft = text(&handle, cx);
+
+    begin_queued_edit(&handle, cx, &dir);
+    add_file(&handle, cx, write_file(&dir, "logs.zip"));
+    remove_chip(&handle, cx, 3);
+    handle
+        .update(cx, |composer, _, cx| composer.clear_queue_edit_local(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    // The draft comes back with its own image and live chip...
+    assert_eq!(text(&handle, cx), draft);
+    assert_eq!(staged_names(&handle, cx), ["Image 1.png"]);
+    handle
+        .read_with(cx, |composer, cx| {
+            assert_eq!(composer.input.read(cx).projection.mentions.len(), 1);
+        })
+        .unwrap();
+    // ...and its own numbering: the edit's numbers never leak into it.
+    paste_images(&handle, cx, 1);
+    assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
+}

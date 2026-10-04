@@ -103,6 +103,18 @@ pub fn chip_names_attachment(
     sanitized(&mention.label) == sanitized(name)
 }
 
+/// Number restored attachments after the chips in `text` that name them, so
+/// those chips stay live; an attachment no chip names is left unnumbered.
+pub fn pair_with_chips(text: &str, attachments: &mut [StagedAttachment]) {
+    let chips = zeron_proto::attachment_mentions::attachment_mentions(text);
+    for att in attachments {
+        att.mention = chips
+            .iter()
+            .find(|chip| chip_names_attachment(chip, &att.name))
+            .map(|chip| chip.index);
+    }
+}
+
 /// The attachments no chip in `text` stands for, in order. A chip is the
 /// attachment's handle wherever it shows, so only these still need a tile;
 /// anything a chip can't be matched to keeps its tile.

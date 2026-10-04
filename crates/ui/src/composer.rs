@@ -5914,6 +5914,10 @@ pub struct Composer {
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
+    /// The displaced draft's chip numbering and undo stash. The queued
+    /// message gets its own while it is edited, so its chips can never name
+    /// the draft's attachments.
+    queue_edit_attachment_draft: Option<AttachmentDraft>,
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
@@ -6241,6 +6245,7 @@ impl Composer {
             state,
             input,
             queue_edit_draft: None,
+            queue_edit_attachment_draft: None,
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
@@ -6684,7 +6689,7 @@ impl Composer {
     /// gone leaves the draft (kept for undo), and one whose chip came back
     /// returns. Attachments the prompt never mentions are left alone.
     fn reconcile_attachment_mentions(&mut self, cx: &mut Context<Self>) {
-        if self.wizard.is_none() && !self.queue_edit_finishing && self.editing_queued.is_none() {
+        if self.wizard.is_none() && !self.queue_edit_finishing {
             let mentioned = zeron_proto::attachment_mentions::attachment_mention_indices(
                 self.input.read(cx).text(),
             );
@@ -6714,6 +6719,25 @@ impl Composer {
             }
         }
         self.sync_attachment_chips(cx);
+    }
+
+    /// Set the draft's chip numbering and undo stash aside while a queued
+    /// message occupies the composer.
+    pub(crate) fn displace_attachment_draft(&mut self) {
+        self.queue_edit_attachment_draft = Some(
+            self.attachment_drafts
+                .remove(&self.current_key)
+                .unwrap_or_default(),
+        );
+    }
+
+    /// Bring back what [`Self::displace_attachment_draft`] set aside; the
+    /// edit's own numbering and stash are dropped with it.
+    pub(crate) fn restore_attachment_draft(&mut self) {
+        if let Some(draft) = self.queue_edit_attachment_draft.take() {
+            self.attachment_drafts
+                .insert(self.current_key.clone(), draft);
+        }
     }
 
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -8309,7 +8333,11 @@ impl Composer {
             if let Some((draft, mut attachments, mut appshots)) = self.queue_edit_draft.take() {
                 appshots.extend(self.appshots.remove(&self.current_key).unwrap_or_default());
                 self.appshots.insert(self.current_key.clone(), appshots);
-                let edited = self.input.read(cx).text().to_string();
+                // The edit's chip numbers would collide with the draft's: its
+                // chips become their labels and its attachments plain tiles.
+                let edited = zeron_proto::attachment_mentions::attachment_mention_prompt(
+                    self.input.read(cx).text(),
+                );
                 let text = [draft, edited]
                     .into_iter()
                     .filter(|text| !text.is_empty())
@@ -8319,7 +8347,12 @@ impl Composer {
                 attachments.extend(
                     self.attachments
                         .remove(&self.current_key)
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|att| StagedAttachment {
+                            mention: None,
+                            ..att
+                        }),
                 );
                 self.attachments
                     .insert(self.current_key.clone(), attachments);

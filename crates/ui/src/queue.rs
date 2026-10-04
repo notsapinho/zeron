@@ -1400,7 +1400,7 @@ impl Composer {
                             None,
                         ).await.map(|loaded| crate::attachments::StagedAttachment {
                             id: uuid::Uuid::new_v4().to_string(),
-                            mention: zeron_proto::attachment_mentions::image_index_from_name(&loaded.name),
+                            mention: None,
                             name: loaded.name,
                             content: crate::attachments::AttachmentContent::Image(loaded.image),
                         })
@@ -1494,15 +1494,12 @@ impl Composer {
                         composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
                         composer.queue_edit_chat_id = Some(chat_id.clone());
                         composer.queue_edit_host_device_id = Some(host_device_id.clone());
-                        composer.queue_edit_draft = Some((
-                            composer.input.read(cx).text().to_string(),
-                            composer.attachments.remove(&composer.current_key).unwrap_or_default(),
-                            composer.appshots.remove(&composer.current_key).unwrap_or_default(),
-                        ));
-                        composer.attachments.insert(composer.current_key.clone(), loaded_attachments);
-                        composer.appshots.insert(composer.current_key.clone(), loaded_appshots);
-                        composer.focus_pending = true;
-                        composer.input.update(cx, |input, cx| input.set_text(text, cx));
+                        composer.swap_in_queued_draft(
+                            text,
+                            std::mem::take(&mut loaded_attachments),
+                            std::mem::take(&mut loaded_appshots),
+                            cx,
+                        );
                         composer.start_queue_edit_renewal(engine.clone(), cx);
                     }
                     Ok(reply)
@@ -1528,6 +1525,42 @@ impl Composer {
         self.queue_edit_task = Some(task);
     }
 
+    /// Set the draft aside and fill the composer with a queued message.
+    /// Restored attachments take the numbers of the chips that name them, so
+    /// those chips stay live; the draft's own numbering waits with the draft.
+    pub(crate) fn swap_in_queued_draft(
+        &mut self,
+        text: String,
+        mut attachments: Vec<crate::attachments::StagedAttachment>,
+        appshots: Vec<crate::appshots::CapturedAppshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_edit_draft = Some((
+            self.input.read(cx).text().to_string(),
+            self.attachments
+                .remove(&self.current_key)
+                .unwrap_or_default(),
+            self.appshots.remove(&self.current_key).unwrap_or_default(),
+        ));
+        self.displace_attachment_draft();
+        crate::attachments::pair_with_chips(&text, &mut attachments);
+        self.attachments
+            .insert(self.current_key.clone(), attachments);
+        self.appshots.insert(self.current_key.clone(), appshots);
+        self.focus_pending = true;
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
+    /// The text a queue edit saves: a chip whose attachment was removed is
+    /// saved as its plain label.
+    pub(crate) fn queue_edit_text(&self, cx: &gpui::App) -> String {
+        let attached: Vec<u32> = self.staged().iter().filter_map(|att| att.mention).collect();
+        zeron_proto::attachment_mentions::demote_unattached_mentions(
+            self.input.read(cx).text(),
+            &attached,
+        )
+    }
+
     /// Save the composer into the existing row, including its attachments.
     /// An entirely empty composer removes the row.
     pub(crate) fn commit_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1540,7 +1573,7 @@ impl Composer {
         {
             return true;
         }
-        let text = self.input.read(cx).text().to_string();
+        let text = self.queue_edit_text(cx);
         if !self.check_reference_delivery(&text, cx) {
             return true;
         }
@@ -1567,7 +1600,7 @@ impl Composer {
         self.clear_queue_edit_local(cx);
     }
 
-    fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
         self.editing_queued = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
@@ -1582,6 +1615,7 @@ impl Composer {
         });
         self.queue_edit_task = None;
         self.queue_edit_renew_task = None;
+        self.restore_attachment_draft();
         if let Some((text, attachments, appshots)) = self.queue_edit_draft.take() {
             self.appshots.insert(self.current_key.clone(), appshots);
             self.input.update(cx, |input, cx| input.set_text(text, cx));
