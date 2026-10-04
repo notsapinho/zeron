@@ -1324,10 +1324,34 @@ pub fn rows_for_entry(
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
         let body = agent_message_display(&body);
-        let (text, mentions) = match crate::composer::sent_mention_display(&body) {
+        // Chips stand in for their attachments: those leave the strip, and an
+        // image chip carries its upload's path so a click can open it.
+        let chips = zeron_proto::attachment_mentions::attachment_mentions(&body);
+        let mut attachments = parsed.attachments;
+        let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
         };
+        for span in &mut mentions {
+            let Some(chip) = chips
+                .iter()
+                .find(|chip| chip.is_image && Some(chip.index) == span.attachment)
+            else {
+                continue;
+            };
+            if let Some(att) = attachments
+                .iter()
+                .find(|att| crate::attachments::chip_names_attachment(chip, &att.path))
+            {
+                span.path = att.path.clone().into();
+            }
+        }
+        attachments.retain(|att| {
+            att.appshot.is_some()
+                || !chips
+                    .iter()
+                    .any(|chip| crate::attachments::chip_names_attachment(chip, &att.path))
+        });
         let copy_text = (!text.trim().is_empty()).then(|| SharedString::from(text.clone()));
         return vec![Row {
             id: entry.id.clone().into(),
@@ -1336,7 +1360,7 @@ pub fn rows_for_entry(
             kind: RowKind::User {
                 text: text.into(),
                 mentions: Arc::new(mentions),
-                attachments: Arc::new(parsed.attachments),
+                attachments: Arc::new(attachments),
                 badges: Arc::new(badges),
                 pending,
             },
@@ -5468,10 +5492,24 @@ impl Transcript {
         let mut keys = std::collections::HashSet::new();
         for row in &self.rows {
             // Generated images use bounded LRU retention, not history-wide protection.
-            if let RowKind::User { attachments, .. } = &row.kind {
-                for att in attachments.iter() {
+            if let RowKind::User {
+                attachments,
+                mentions,
+                ..
+            } = &row.kind
+            {
+                let chipped = mentions
+                    .iter()
+                    .filter(|span| span.kind == crate::composer::ChipKind::Image)
+                    .map(|span| span.path.to_string())
+                    .filter(|path| !path.is_empty());
+                for path in attachments
+                    .iter()
+                    .map(|att| att.path.clone())
+                    .chain(chipped)
+                {
                     for dev in &devices {
-                        keys.insert((dev.clone(), att.path.clone()));
+                        keys.insert((dev.clone(), path.clone()));
                     }
                 }
             }
@@ -5652,6 +5690,27 @@ impl Transcript {
     /// collapsing the bubble to min-content width (one character per line).
     /// A plain height clip preserves the original bubble width calculation and
     /// never feeds measured layout back into the virtualized list.
+    /// Open a sent image chip's upload full size, as its thumbnail did. An
+    /// image still loading opens on a later click.
+    fn open_chip_image(
+        &mut self,
+        path: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let device_ids = self.attachment_device_ids(cx);
+        if let crate::attachments::AttachmentSnapshot::Loaded(image) =
+            self.attachment_state(&device_ids, path, None, cx)
+        {
+            let preview = crate::attachments::PreviewImage::new(image.name, image.image.clone());
+            self.attachment_preview_return_focus = window.focused(cx);
+            preview.viewer.reset();
+            self.attachment_preview = Some(preview);
+            window.focus(&self.attachment_preview_focus, cx);
+            cx.notify();
+        }
+    }
+
     fn render_user_body(
         &mut self,
         row_id: &SharedString,
@@ -5662,6 +5721,18 @@ impl Transcript {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Load image chips' uploads ahead of a click, as the strip did.
+        let chip_images: Vec<SharedString> = mentions
+            .iter()
+            .filter(|span| span.kind == crate::composer::ChipKind::Image && !span.path.is_empty())
+            .map(|span| span.path.clone())
+            .collect();
+        if !chip_images.is_empty() {
+            let device_ids = self.attachment_device_ids(cx);
+            for path in &chip_images {
+                self.attachment_state(&device_ids, path, None, cx);
+            }
+        }
         let fold = self.user_folds.get(row_id).copied().unwrap_or_default();
         let expanded = fold.open.unwrap_or(false);
         let line_height =
@@ -5733,6 +5804,9 @@ impl Transcript {
                 theme,
                 measured_h.clone(),
                 cx.entity_id(),
+                Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
+                    this.open_chip_image(path, window, cx);
+                })),
             ));
         // Height motion uses the same ease-out curve as sidebars, tool folds,
         // and pane transitions, with duration scaled to travel distance. The
@@ -7951,6 +8025,7 @@ fn user_bubble_text(
     theme: &Theme,
     measured_h: Rc<Cell<f32>>,
     entity_id: gpui::EntityId,
+    open_image: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
 ) -> AnyElement {
     // Split runs at chip boundaries (spans are in order): body text keeps the
     // sans font, chips read as inline code. Size/line-height flow from the
@@ -8011,6 +8086,13 @@ fn user_bubble_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
+    // Image chips paired with their upload open it, as the thumbnails did.
+    let image_chips: Vec<(Range<usize>, SharedString)> = mentions
+        .iter()
+        .filter(|span| span.kind == crate::composer::ChipKind::Image && !span.path.is_empty())
+        .map(|span| (span.range.clone(), span.path.clone()))
+        .collect();
+    let chip_layout = layout.clone();
     let chip_icons: Vec<crate::composer::ChipIcon> = mentions
         .iter()
         .map(|span| crate::composer::chip_icon(span.kind, &span.path, theme.appearance))
@@ -8056,10 +8138,129 @@ fn user_bubble_text(
     .size_full();
     // Same wrapper as the assistant markdown: user-bubble text is
     // selectable (paint_text_selection above), so it gets the I-beam too.
-    render::selectable_text_wrap()
+    let text = render::selectable_text_wrap()
         .child(underlay)
         .child(styled)
-        .into_any_element()
+        .into_any_element();
+    if image_chips.is_empty() {
+        return text;
+    }
+    ImageChipTargets {
+        id: format!("{row_id}-image-chips").into(),
+        child: text,
+        layout: chip_layout,
+        chips: image_chips,
+        open: open_image,
+    }
+    .into_any_element()
+}
+
+/// Wraps a sent bubble's text with a pointer target over each image chip; a
+/// click opens the image full size. Targets follow the shaped text, so a chip
+/// that wraps gets one per row.
+struct ImageChipTargets {
+    id: SharedString,
+    child: AnyElement,
+    layout: gpui::TextLayout,
+    chips: Vec<(Range<usize>, SharedString)>,
+    open: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)>,
+}
+
+impl IntoElement for ImageChipTargets {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for ImageChipTargets {
+    type RequestLayoutState = ();
+    type PrepaintState = Vec<AnyElement>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        Some(self.id.clone().into())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Vec<AnyElement> {
+        self.child.prepaint(window, cx);
+        let mut targets = Vec::new();
+        for (index, (range, path)) in self.chips.iter().enumerate() {
+            for (part, rect) in render::range_rects(&self.layout, range, 0.0, 2.0)
+                .into_iter()
+                .enumerate()
+            {
+                let open = self.open.clone();
+                let path = path.clone();
+                let mut target = div()
+                    .id(SharedString::from(format!("{}-{index}-{part}", self.id)))
+                    .w(rect.size.width)
+                    .h(rect.size.height)
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(format!(
+                        "Preview {}",
+                        crate::attachments::attachment_display_name(
+                            path.rsplit(['/', '\\']).next().unwrap_or(&path),
+                        )
+                    ))
+                    .on_click(move |event, window, cx| {
+                        // A drag that selects text across the chip is not a click.
+                        if event.click_count() == 1
+                            && crate::markdown::selection::selected_text().is_none()
+                        {
+                            open(&path, window, cx);
+                        }
+                    })
+                    .into_any_element();
+                target.prepaint_as_root(
+                    rect.origin,
+                    rect.size.map(gpui::AvailableSpace::Definite),
+                    window,
+                    cx,
+                );
+                targets.push(target);
+            }
+        }
+        targets
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        targets: &mut Vec<AnyElement>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        self.child.paint(window, cx);
+        for target in targets {
+            target.paint(window, cx);
+        }
+    }
 }
 
 /// A sent message's non-image attachment: the file's icon and name on the
@@ -14060,9 +14261,10 @@ mod tests {
     /// prompts keep the empty-spans fast path. The row version derives from
     /// the RAW text either way, so projection never perturbs the diff key.
     /// A sent message with image, file-attachment and workspace-file chips
-    /// reads as chips in the bubble, with the attachments in the strip above.
+    /// reads as chips in the bubble; only attachments without a chip stay in
+    /// the strip above.
     #[test]
-    fn user_bubbles_project_attachment_chips_and_split_the_strip() {
+    fn user_bubbles_project_attachment_chips_in_place_of_the_strip() {
         use crate::composer::ChipKind;
         use zeron_proto::attachment_mentions::attachment_mention_link;
         let body = format!(
@@ -14076,6 +14278,7 @@ mod tests {
             &[
                 "/uploads/ab12cd34-Image_1.png".to_string(),
                 "/uploads/ef56ab78-notes.md".to_string(),
+                "/uploads/0a1b2c3d-Image_3.png".to_string(),
             ],
         );
         let mut entry = assistant("u4", MessageStatus::Complete, vec![]);
@@ -14106,14 +14309,16 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
-        // The strip splits images (thumbnails) from files (pills).
+        // Chips stand in for their attachments: only the unchipped image is
+        // left in the strip, and the image chip carries its upload to open.
         assert_eq!(
             attachments
                 .iter()
-                .map(|a| crate::attachments::is_image_path(&a.path))
+                .map(|a| a.path.as_str())
                 .collect::<Vec<_>>(),
-            [true, false]
+            ["/uploads/0a1b2c3d-Image_3.png"]
         );
+        assert_eq!(mentions[0].path.as_ref(), "/uploads/ab12cd34-Image_1.png");
 
         // A files-only send hides the placeholder body.
         let raw = crate::attachments::with_attachments("", &["/uploads/ef56ab78-notes.md".into()]);

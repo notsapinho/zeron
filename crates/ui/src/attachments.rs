@@ -77,15 +77,16 @@ pub fn attachment_display_name(name: &str) -> &str {
     }
 }
 
-/// The attachments no chip in `text` stands for, in order. A chip is the
-/// attachment's handle wherever it shows, so only these still need a tile.
-/// Images match by draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by
-/// name as the engine sanitizes it; anything unmatched keeps its tile.
-pub fn unchipped_attachments<'a>(text: &str, paths: &'a [String]) -> Vec<&'a String> {
-    use zeron_proto::attachment_mentions::{attachment_mentions, image_index_from_name};
-    let mentions = attachment_mentions(text);
-    if mentions.is_empty() {
-        return paths.iter().collect();
+/// Whether `mention` is the chip for the attachment at `path`. Images match
+/// by draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by name as the
+/// engine sanitizes it.
+pub fn chip_names_attachment(
+    mention: &zeron_proto::attachment_mentions::AttachmentMention,
+    path: &str,
+) -> bool {
+    if mention.is_image {
+        return zeron_proto::attachment_mentions::image_index_from_name(path)
+            == Some(mention.index);
     }
     let sanitized = |name: &str| -> String {
         name.chars()
@@ -98,18 +99,21 @@ pub fn unchipped_attachments<'a>(text: &str, paths: &'a [String]) -> Vec<&'a Str
             })
             .collect()
     };
+    let name = attachment_display_name(path.rsplit(['/', '\\']).next().unwrap_or(path));
+    sanitized(&mention.label) == sanitized(name)
+}
+
+/// The attachments no chip in `text` stands for, in order. A chip is the
+/// attachment's handle wherever it shows, so only these still need a tile;
+/// anything a chip can't be matched to keeps its tile.
+pub fn unchipped_attachments<'a>(text: &str, paths: &'a [String]) -> Vec<&'a String> {
+    let mentions = zeron_proto::attachment_mentions::attachment_mentions(text);
     paths
         .iter()
         .filter(|path| {
-            let name = attachment_display_name(path.rsplit(['/', '\\']).next().unwrap_or(path));
-            let index = image_index_from_name(path);
-            !mentions.iter().any(|mention| {
-                if mention.is_image {
-                    index == Some(mention.index)
-                } else {
-                    sanitized(&mention.label) == sanitized(name)
-                }
-            })
+            !mentions
+                .iter()
+                .any(|mention| chip_names_attachment(mention, path))
         })
         .collect()
 }
