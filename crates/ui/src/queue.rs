@@ -599,21 +599,22 @@ impl Composer {
                     .line_height(px(line_height))
                     .text_color(theme.text.opacity(0.9))
                     .child(crate::composer::chip_text(text, chips, theme));
-                let labels = queue_attachment_labels(&item.text, &item.attachments);
+                // Attachments the row's chips already show get no tile.
+                let tiled: Vec<String> =
+                    crate::attachments::unchipped_attachments(&item.text, &item.attachments)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                let labels = queue_attachment_labels(&item.text, &tiled);
                 let limit = self.queue_preview_limit();
                 let hidden = queue_hidden_attachments_label(&labels, limit);
-                el.children(
-                    item.attachments
-                        .iter()
-                        .zip(&labels)
-                        .take(limit)
-                        .enumerate()
-                        .map(|(index, (path, label))| {
-                            self.queue_thumbnail(&key, index, path, label.into(), cx)
-                        }),
-                )
+                el.children(tiled.iter().zip(&labels).take(limit).enumerate().map(
+                    |(index, (path, label))| {
+                        self.queue_thumbnail(&key, index, path, label.into(), cx)
+                    },
+                ))
                 .when_some(hidden, |el, hidden| {
-                    let remaining = item.attachments.len() - limit;
+                    let remaining = tiled.len() - limit;
                     let hidden: SharedString = hidden.into();
                     el.child(
                         div()
@@ -732,7 +733,11 @@ impl Composer {
         );
         let keys: std::collections::HashSet<_> = items[visible]
             .iter()
-            .flat_map(|item| item.attachments.iter().take(self.queue_preview_limit()))
+            .flat_map(|item| {
+                attachments::unchipped_attachments(&item.text, &item.attachments)
+                    .into_iter()
+                    .take(self.queue_preview_limit())
+            })
             .filter(|path| attachments::is_image_path(path))
             .map(|path| (device.clone(), path.clone()))
             .take(64)

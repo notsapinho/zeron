@@ -77,6 +77,43 @@ pub fn attachment_display_name(name: &str) -> &str {
     }
 }
 
+/// The attachments no chip in `text` stands for, in order. A chip is the
+/// attachment's handle wherever it shows, so only these still need a tile.
+/// Images match by draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by
+/// name as the engine sanitizes it; anything unmatched keeps its tile.
+pub fn unchipped_attachments<'a>(text: &str, paths: &'a [String]) -> Vec<&'a String> {
+    use zeron_proto::attachment_mentions::{attachment_mentions, image_index_from_name};
+    let mentions = attachment_mentions(text);
+    if mentions.is_empty() {
+        return paths.iter().collect();
+    }
+    let sanitized = |name: &str| -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    paths
+        .iter()
+        .filter(|path| {
+            let name = attachment_display_name(path.rsplit(['/', '\\']).next().unwrap_or(path));
+            let index = image_index_from_name(path);
+            !mentions.iter().any(|mention| {
+                if mention.is_image {
+                    index == Some(mention.index)
+                } else {
+                    sanitized(&mention.label) == sanitized(name)
+                }
+            })
+        })
+        .collect()
+}
+
 /// How attachments ride the prompt (use-attachments.ts `withAttachments`):
 /// plain local paths appended to the text — the files are staged on the device
 /// that runs the agent, so the agent can open them with its own tools; the
@@ -1750,6 +1787,31 @@ mod generated_image_tests {
                 "done": true,
             }))
         }
+    }
+
+    #[test]
+    fn chips_stand_in_for_their_attachments() {
+        use zeron_proto::attachment_mentions::attachment_mention_link;
+        let paths: Vec<String> = [
+            "/uploads/ab12cd34-Image_1.png",
+            "pending://att-2/my notes.md",
+            "/uploads/ef56ab78-Image_3.png",
+            "/uploads/0a1b2c3d-Cargo.toml",
+        ]
+        .map(String::from)
+        .to_vec();
+        let text = format!(
+            "compare {} with {}",
+            attachment_mention_link(1, None),
+            attachment_mention_link(2, Some("my notes.md")),
+        );
+        // Image 3 and Cargo.toml have no chip, so they keep their tiles.
+        assert_eq!(unchipped_attachments(&text, &paths), [&paths[2], &paths[3]]);
+        // A committed upload sanitizes the name the chip still carries.
+        let committed = vec!["/uploads/12345678-my_notes.md".to_string()];
+        assert!(unchipped_attachments(&text, &committed).is_empty());
+        // Plain text keeps every tile.
+        assert_eq!(unchipped_attachments("Image 1", &paths).len(), 4);
     }
 
     #[tokio::test]

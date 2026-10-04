@@ -4868,9 +4868,9 @@ impl gpui::Element for ComposerTextElement {
                 let chip_bounds = Bounds::new(
                     point(
                         origin.x + local_bounds.origin.x,
-                        // A pixel lower than the row's middle: the text's
-                        // visual center sits below the line box's.
-                        origin.y + local_bounds.origin.y + px(2.5),
+                        // Centered on the row, which centers the label (see
+                        // `paint_chip`).
+                        origin.y + local_bounds.origin.y + px(1.5),
                     ),
                     size(local_bounds.size.width, local_bounds.size.height - px(3.0)),
                 );
@@ -6381,6 +6381,24 @@ impl Composer {
             .unwrap_or(&[])
     }
 
+    /// Staged attachments that get a tile above the input. One the draft
+    /// mentions as a chip is already on screen there (hover previews it,
+    /// deleting it unstages it), so only attachments without a chip are tiled.
+    fn tiled_attachments<'a>(&'a self, cx: &App) -> Vec<&'a StagedAttachment> {
+        let chipped: Vec<u32> = self
+            .input
+            .read(cx)
+            .projection
+            .mentions
+            .iter()
+            .filter_map(|(link, _)| link.attachment)
+            .collect();
+        self.staged()
+            .iter()
+            .filter(|att| att.mention.is_none_or(|index| !chipped.contains(&index)))
+            .collect()
+    }
+
     pub(crate) fn queue_preview_limit(&self) -> usize {
         if self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) < 520.0 {
             1
@@ -6803,9 +6821,10 @@ impl Composer {
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
     /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
-    /// revealed on hover, click opens the full-size preview.
+    /// revealed on hover, click opens the full-size preview. Attachments with
+    /// a chip in the draft are left out.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let staged = self.staged();
+        let staged = self.tiled_attachments(cx);
         if staged.is_empty() {
             return None;
         }
@@ -10769,7 +10788,7 @@ impl Render for Composer {
         // `morph_t`) animates. Steady state renders exactly the target.
         // Staged attachments add the wrap strip's height to the pill in BOTH
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
-        let staged_count = self.staged().len();
+        let staged_count = self.tiled_attachments(cx).len();
         // The input width excludes the inline controls in compact mode.
         // Wrap against the pill's content width in both modes, accounting
         // for the outer container padding and the pill's 1px borders.

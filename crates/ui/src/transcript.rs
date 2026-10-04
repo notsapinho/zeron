@@ -8021,13 +8021,11 @@ fn user_bubble_text(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, cx| {
             for (span, icon) in mentions.iter().zip(&chip_icons) {
-                for (row, mut rect) in render::range_rects(&layout, &span.range, 0.0, 2.0)
+                // Centered on the line box like the composer's chips.
+                for (row, rect) in render::range_rects(&layout, &span.range, 0.0, 2.0)
                     .into_iter()
                     .enumerate()
                 {
-                    // Matches the composer: the text sits a pixel below the
-                    // line box's middle.
-                    rect.origin.y += px(1.0);
                     let icon = (row == 0).then_some(icon);
                     crate::composer::paint_chip(window, rect, icon, &sel_theme, cx);
                 }
