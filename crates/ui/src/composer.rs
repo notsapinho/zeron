@@ -996,7 +996,8 @@ struct TextProjection {
 struct MentionTooltipTarget {
     range: Range<usize>,
     path: SharedString,
-    /// Set for attachment chips; an image's tooltip previews it.
+    /// Set for attachment chips. An image chip has no tooltip: a click opens
+    /// the picture full size instead.
     attachment: Option<u32>,
 }
 
@@ -1781,6 +1782,8 @@ pub enum ComposerInputEvent {
         range: Range<usize>,
         revision: u64,
     },
+    /// An image chip was clicked: open its picture full size.
+    OpenAttachment(u32),
 }
 
 #[derive(Clone)]
@@ -2006,8 +2009,10 @@ pub struct ComposerInput {
     /// Last prepainted chip bounds; the paint-phase pointer listener uses
     /// these instead of attempting to infer text geometry from the cursor.
     mention_hits: Vec<MentionHit>,
-    /// The attachments the draft holds, by chip number, with the preview of
-    /// each image. `None` outside the composer, where every attachment link is
+    /// The image chip a click started on, and where.
+    chip_press: Option<(u32, Point<Pixels>)>,
+    /// The attachments the draft holds, by chip number, with each image's
+    /// picture. `None` outside the composer, where every attachment link is
     /// shown as a chip.
     attachment_chips: Option<HashMap<u32, ChipAttachment>>,
     /// The draft the attachment chips belong to; copied chips carry it so a paste
@@ -2098,6 +2103,7 @@ impl ComposerInput {
             mention_open: false,
             mention_has_selection: false,
             mention_hits: Vec::new(),
+            chip_press: None,
             attachment_chips: None,
             attachment_scope: String::new(),
             mention_tooltip: MentionTooltipPhase::Hidden,
@@ -2345,7 +2351,7 @@ impl ComposerInput {
         self.attachment_chips = Some(
             attachments
                 .into_iter()
-                .map(|(index, image)| (index, ChipAttachment::new(image)))
+                .map(|(index, image)| (index, ChipAttachment { image }))
                 .collect(),
         );
         self.invalidate_mention_tooltip();
@@ -2550,14 +2556,9 @@ impl ComposerInput {
                     if let MentionTooltipPhase::Visible { target, generation } =
                         &input.mention_tooltip
                     {
-                        let image = target.attachment.and_then(|index| {
-                            let chip = input.attachment_chips.as_ref()?.get(&index)?;
-                            Some((chip.image.clone()?, chip.preview))
-                        });
                         input.mention_tooltip_view = Some(cx.new(|_| MentionPathTooltip {
                             path: target.path.clone(),
                             activation: *generation,
-                            image,
                         }));
                     }
                     cx.notify();
@@ -2565,6 +2566,22 @@ impl ComposerInput {
             })
             .ok();
         }));
+    }
+
+    fn is_image_chip(&self, target: &MentionTooltipTarget) -> bool {
+        target
+            .attachment
+            .and_then(|index| self.attachment_chips.as_ref()?.get(&index))
+            .is_some_and(|chip| chip.image.is_some())
+    }
+
+    /// The number of the image chip under `position`, if any.
+    fn image_chip_at(&self, position: Point<Pixels>) -> Option<u32> {
+        self.mention_hits
+            .iter()
+            .find(|hit| hit.bounds.contains(&position))
+            .filter(|hit| self.is_image_chip(&hit.target))
+            .and_then(|hit| hit.target.attachment)
     }
 
     fn on_mention_pointer_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -2576,6 +2593,7 @@ impl ComposerInput {
             .mention_hits
             .iter()
             .find(|hit| hit.bounds.contains(&position))
+            .filter(|hit| !self.is_image_chip(&hit.target))
             .map(|hit| hit.target.clone());
         let in_popup = self
             .mention_tooltip_popup
@@ -3840,6 +3858,10 @@ impl ComposerInput {
         self.invalidate_mention_tooltip();
         window.focus(&self.focus_handle, cx);
         let intent = press_intent(event.click_count, event.modifiers.shift);
+        self.chip_press = (intent == PressIntent::PlaceCaret)
+            .then(|| self.image_chip_at(event.position))
+            .flatten()
+            .map(|index| (index, event.position));
         self.is_selecting = true;
         self.drag_position = Some(event.position);
         self.drag_unit = None;
@@ -3919,7 +3941,15 @@ impl ComposerInput {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A click that starts and ends on an image chip opens the picture, as
+        // the thumbnails did; a drag across it only selects.
+        if let Some((index, down)) = self.chip_press.take()
+            && self.image_chip_at(event.position) == Some(index)
+            && (event.position - down).magnitude() <= 4.0
+        {
+            cx.emit(ComposerInputEvent::OpenAttachment(index));
+        }
         self.is_selecting = false;
         self.drag_position = None;
         self.drag_generation = self.drag_generation.wrapping_add(1);
@@ -4676,8 +4706,6 @@ struct ComposerTextElement {
 
 struct MentionPathTooltip {
     path: SharedString,
-    /// An image chip's picture and the size it is shown at.
-    image: Option<(std::sync::Arc<gpui::Image>, (f32, f32))>,
     /// Stable for one `Waiting → Visible` promotion; a later activation gets
     /// a new key and therefore exactly one fresh fade-in.
     activation: u64,
@@ -4686,62 +4714,21 @@ struct MentionPathTooltip {
 impl Render for MentionPathTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();
-        let card = match &self.image {
-            // The chip already names the image, so its card is the picture
-            // alone, with rounded corners inside an even inset.
-            Some((image, (width, height))) => crate::popover::popover_card(&theme)
-                .rounded(px(IMAGE_TOOLTIP_RADIUS))
-                .p(px(IMAGE_TOOLTIP_INSET))
-                .gap(px(0.0))
-                .child(
-                    div()
-                        .w(px(*width))
-                        .h(px(*height))
-                        .rounded(px(IMAGE_TOOLTIP_RADIUS - IMAGE_TOOLTIP_INSET))
-                        .overflow_hidden()
-                        .bg(crate::theme::ink(0.06))
-                        .child(
-                            img(image.clone())
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(IMAGE_TOOLTIP_LABEL_HEIGHT))
-                        .px(px(4.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .text_size(px(11.0))
-                        .child(div().text_color(theme.text).child(self.path.clone()))
-                        .child(
-                            div()
-                                .text_color(theme.text_muted)
-                                .child(format_file_size(image.bytes.len())),
-                        ),
-                ),
-            None => crate::popover::popover_card(&theme)
-                .max_w(px(480.0))
-                .h(px(MENTION_TOOLTIP_HEIGHT))
-                .flex()
-                .items_center()
-                .p_0()
-                .px(px(8.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(div().min_w_0().truncate().child(self.path.clone())),
-        };
+        let card = crate::popover::popover_card(&theme)
+            .max_w(px(480.0))
+            .h(px(MENTION_TOOLTIP_HEIGHT))
+            .flex()
+            .items_center()
+            .p_0()
+            .px(px(8.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(div().min_w_0().truncate().child(self.path.clone()));
         motion::fade_quick(
             ("file-mention-path-tooltip", self.activation),
             div().child(crate::frost::frosted(
-                if self.image.is_some() {
-                    IMAGE_TOOLTIP_RADIUS
-                } else {
-                    crate::popover::CARD_RADIUS
-                },
+                crate::popover::CARD_RADIUS,
                 crate::frost::MENU_BLUR,
                 card,
             )),
@@ -4754,6 +4741,8 @@ struct ComposerTextPrepaint {
     /// Each chip row's bounds; the first row of a chip also carries its icon.
     mention_chips: Vec<(Bounds<Pixels>, Option<ChipIcon>)>,
     mention_hits: Vec<MentionHit>,
+    /// Image chips take the pointing hand: a click opens them.
+    image_chip_hitboxes: Vec<gpui::Hitbox>,
     selection_quads: Vec<PaintQuad>,
     /// Completion preview: window-space origin of the end-of-text caret plus
     /// the suffix to paint there (shaped at paint time — it never joins the
@@ -4855,21 +4844,8 @@ impl gpui::Element for ComposerTextElement {
                 },
                 attachment: mention.attachment,
             };
-            // A picture floats a little clear of its chip; the path tooltip
-            // stays flush so the pointer can move onto it.
-            let (tooltip_height, tooltip_gap) = mention
-                .attachment
-                .and_then(|index| input.attachment_chips.as_ref()?.get(&index))
-                .filter(|chip| chip.image.is_some())
-                .map_or((MENTION_TOOLTIP_HEIGHT, 1.0), |chip| {
-                    (
-                        chip.preview.1
-                            + IMAGE_TOOLTIP_LABEL_HEIGHT
-                            + 2.0 * IMAGE_TOOLTIP_INSET
-                            + 2.0,
-                        5.0,
-                    )
-                });
+            // The path tooltip stays flush so the pointer can move onto it.
+            let (tooltip_height, tooltip_gap) = (MENTION_TOOLTIP_HEIGHT, 1.0);
             for local_bounds in input.bounds_for_display_range(display.clone()) {
                 let chip_bounds = Bounds::new(
                     point(
@@ -4998,10 +4974,16 @@ impl gpui::Element for ComposerTextElement {
                     .point_for_index(input.content.len())
                     .map(|p| (point(origin.x + p.x, origin.y + p.y), g))
             });
+        let image_chip_hitboxes = mention_hits
+            .iter()
+            .filter(|hit| input.is_image_chip(&hit.target))
+            .map(|hit| window.insert_hitbox(hit.bounds, gpui::HitboxBehavior::Normal))
+            .collect();
         ComposerTextPrepaint {
             cursor,
             mention_chips,
             mention_hits,
+            image_chip_hitboxes,
             selection_quads,
             ghost,
         }
@@ -5032,6 +5014,9 @@ impl gpui::Element for ComposerTextElement {
                 input.update(cx, |input, cx| input.on_mouse_move(event, cx));
             }
         });
+        for hitbox in &prepaint.image_chip_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
@@ -6201,6 +6186,7 @@ impl Composer {
                     this.dismiss_mention(cx)
                 }
             }
+            ComposerInputEvent::OpenAttachment(index) => this.open_attachment(*index, cx),
             ComposerInputEvent::PastedImages(images) => {
                 let images = images.clone();
                 this.stage_in_background(
@@ -6416,6 +6402,23 @@ impl Composer {
         } else {
             2
         }
+    }
+
+    /// Open a staged image full size, from its chip (the tiles' click).
+    fn open_attachment(&mut self, index: u32, cx: &mut Context<Self>) {
+        let Some((name, image)) = self
+            .staged()
+            .iter()
+            .filter(|att| att.mention == Some(index))
+            .find_map(|att| Some((att.name.clone(), att.image()?.clone())))
+        else {
+            return;
+        };
+        let preview = attachments::PreviewImage::new(name, image);
+        preview.viewer.reset();
+        self.preview = Some(preview);
+        self.preview_focus_pending = true;
+        cx.notify();
     }
 
     pub(crate) fn show_queue_image(

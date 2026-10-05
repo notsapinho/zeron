@@ -1,58 +1,10 @@
 //! What a chip looks like: its pill, icon and hover preview.
 use super::*;
 
-/// The hover card around an image chip's preview: padding on every side.
-pub(super) const IMAGE_TOOLTIP_INSET: f32 = 5.0;
-/// The name-and-size row under the preview.
-pub(super) const IMAGE_TOOLTIP_LABEL_HEIGHT: f32 = 22.0;
-pub(super) const IMAGE_TOOLTIP_RADIUS: f32 = 16.0;
-const IMAGE_TOOLTIP_MAX: (f32, f32) = (240.0, 160.0);
-
-/// "443 KB", "1.2 MB": what an attachment weighs, for hover cards.
-pub(super) fn format_file_size(bytes: usize) -> String {
-    const KB: f64 = 1024.0;
-    let bytes = bytes as f64;
-    if bytes < KB {
-        format!("{} B", bytes as usize)
-    } else if bytes < KB * KB {
-        format!("{} KB", (bytes / KB).round() as usize)
-    } else {
-        format!("{:.1} MB", bytes / (KB * KB))
-    }
-}
-
-/// A staged attachment an attachment chip can refer to. An image carries the
-/// size of its hover preview: its own aspect ratio, contained in
-/// [`IMAGE_TOOLTIP_MAX`] and never enlarged past its pixels.
+/// A staged attachment an attachment chip can refer to; an image chip opens
+/// its picture on click.
 pub(super) struct ChipAttachment {
     pub(super) image: Option<std::sync::Arc<gpui::Image>>,
-    pub(super) preview: (f32, f32),
-}
-
-impl ChipAttachment {
-    pub(super) fn new(image: Option<std::sync::Arc<gpui::Image>>) -> Self {
-        let Some(picture) = &image else {
-            return Self {
-                image,
-                preview: (0.0, 0.0),
-            };
-        };
-        let (width, height) =
-            ::image::ImageReader::new(std::io::Cursor::new(picture.bytes.as_slice()))
-                .with_guessed_format()
-                .ok()
-                .and_then(|reader| reader.into_dimensions().ok())
-                .filter(|(width, height)| *width > 0 && *height > 0)
-                .unwrap_or((16, 10));
-        let scale = (IMAGE_TOOLTIP_MAX.0 / width as f32)
-            .min(IMAGE_TOOLTIP_MAX.1 / height as f32)
-            .min(1.0);
-        let preview = (
-            (width as f32 * scale).max(48.0),
-            (height as f32 * scale).max(32.0),
-        );
-        Self { image, preview }
-    }
 }
 
 /// Spaces reserve room at the start of every chip for its icon well, which is

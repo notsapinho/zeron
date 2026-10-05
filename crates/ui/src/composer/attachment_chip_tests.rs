@@ -720,3 +720,73 @@ fn leaving_a_queued_edit_restores_the_draft_and_its_numbering(cx: &mut gpui::Tes
     paste_images(&handle, cx, 1);
     assert_eq!(staged_names(&handle, cx), ["Image 1.png", "Image 2.png"]);
 }
+
+/// Press on the first chip and release `drag` away from where it went down.
+fn click_first_chip(
+    handle: &gpui::WindowHandle<Composer>,
+    cx: &mut gpui::TestAppContext,
+    drag: Point<Pixels>,
+) {
+    cx.update_window((*handle).into(), |_, window, cx| window.draw(cx).clear())
+        .unwrap();
+    handle
+        .update(cx, |composer, window, cx| {
+            composer.input.update(cx, |input, cx| {
+                let at = input.mention_hits[0].bounds.center();
+                input.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: at,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                input.on_mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: at + drag,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn clicking_an_image_chip_opens_the_picture_full_size(cx: &mut gpui::TestAppContext) {
+    let (_dir, handle) = composer_focus_window(cx);
+    paste_images(&handle, cx, 1);
+    // Hovering shows no card: the click is how the picture is seen.
+    cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+        .unwrap();
+    handle
+        .update(cx, |composer, _, cx| {
+            composer.input.update(cx, |input, cx| {
+                let at = input.mention_hits[0].bounds.center();
+                input.on_mention_pointer_move(at, cx);
+                assert_eq!(input.mention_tooltip, MentionTooltipPhase::Hidden);
+            });
+        })
+        .unwrap();
+
+    // A drag across the chip only selects.
+    click_first_chip(&handle, cx, point(px(40.0), px(0.0)));
+    handle
+        .read_with(cx, |composer, _| assert!(composer.preview.is_none()))
+        .unwrap();
+
+    click_first_chip(&handle, cx, point(px(0.0), px(0.0)));
+    handle
+        .read_with(cx, |composer, _| {
+            let preview = composer.preview.as_ref().expect("the chip opens its image");
+            assert_eq!(preview.name.as_ref(), "Image 1.png");
+        })
+        .unwrap();
+}
