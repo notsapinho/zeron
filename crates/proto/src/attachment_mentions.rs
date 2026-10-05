@@ -20,6 +20,30 @@ pub struct AttachmentMention {
     pub is_image: bool,
 }
 
+impl AttachmentMention {
+    /// Whether this chip names the attachment at `path`. Images match by
+    /// draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by name as
+    /// the engine sanitizes it.
+    pub fn names_attachment(&self, path: &str) -> bool {
+        if self.is_image {
+            return image_index_from_name(path) == Some(self.index);
+        }
+        let sanitized = |name: &str| -> String {
+            name.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let name = attachment_display_name(path.rsplit(['/', '\\']).next().unwrap_or(path));
+        sanitized(&self.label) == sanitized(name)
+    }
+}
+
 /// The user-visible name of the `index`th image of a draft.
 pub fn image_label(index: u32) -> String {
     format!("Image {index}")

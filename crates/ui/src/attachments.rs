@@ -70,30 +70,12 @@ pub fn is_image_path(path: &str) -> bool {
 
 pub use zeron_proto::attachment_mentions::attachment_display_name;
 
-/// Whether `mention` is the chip for the attachment at `path`. Images match
-/// by draft number (`Image 2` ↔ `ab12cd34-Image_2.png`), files by name as the
-/// engine sanitizes it.
+/// Whether `mention` is the chip for the attachment at `path`.
 pub fn chip_names_attachment(
     mention: &zeron_proto::attachment_mentions::AttachmentMention,
     path: &str,
 ) -> bool {
-    if mention.is_image {
-        return zeron_proto::attachment_mentions::image_index_from_name(path)
-            == Some(mention.index);
-    }
-    let sanitized = |name: &str| -> String {
-        name.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    let name = attachment_display_name(path.rsplit(['/', '\\']).next().unwrap_or(path));
-    sanitized(&mention.label) == sanitized(name)
+    mention.names_attachment(path)
 }
 
 /// Number restored attachments after the chips in `text` that name them, so
